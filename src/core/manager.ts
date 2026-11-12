@@ -56,6 +56,7 @@ interface Runtime {
   engineError?: string
   closing?: boolean
   seq?: number
+  children?: Map<string, Runtime>
 }
 
 const emptyTokens = (): Tokens => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
@@ -292,6 +293,7 @@ export class Manager {
     void omp.exited.then(({ code }) => {
       if (!rt.closing) this.#engineFailure(rt, new Error(`omp exited (${code})`))
     })
+    await omp.send({ type: "set_subagent_subscription", level: "events" }).catch(() => undefined)
     if (rt.info.model) {
       await omp
         .send({ type: "set_model", provider: rt.info.model.providerID, modelId: rt.info.model.id })
@@ -309,10 +311,119 @@ export class Manager {
   }
 
   #onEngineEvent(rt: Runtime, event: OmpEvent): void {
+    if (event.type.startsWith("subagent_")) {
+      this.#onSubagentFrame(rt, event)
+      return
+    }
     if (!rt.translator) return
     const envelopes = rt.translator.translate(event)
     if (process.env.OPENPI_DEBUG) console.log(`[omp] ${event.type} -> ${envelopes.length} event(s)`)
     for (const envelope of envelopes) this.#emit(rt, envelope)
+  }
+
+  // OMP task subagents become OpenCode child sessions (parentID), so the UI's
+  // existing subagent surfaces can render them.
+  #onSubagentFrame(rt: Runtime, frame: OmpEvent): void {
+    const payload = frame.payload as Record<string, unknown> | undefined
+    if (!payload) return
+
+    if (frame.type === "subagent_progress") {
+      this.#childRuntime(rt, String(payload.id ?? ""), payload)
+      return
+    }
+
+    if (frame.type === "subagent_event") {
+      const inner = payload.event as OmpEvent | undefined
+      if (!inner?.type) return
+      const child = this.#childRuntime(rt, String(payload.id ?? ""), payload)
+      if (!child) return
+      if (inner.type.startsWith("subagent_")) {
+        this.#onSubagentFrame(child, inner)
+        return
+      }
+      for (const envelope of child.translator?.translate(inner) ?? []) this.#emit(child, envelope)
+      return
+    }
+
+    if (frame.type !== "subagent_lifecycle") return
+    const id = String(payload.id ?? "")
+    const child = this.#childRuntime(rt, id, payload)
+    if (!child) return
+    const status = payload.status
+    if (status === "started") {
+      this.#publish(child, "session.execution.started", {}, 1)
+      return
+    }
+    const outcome = status === "completed" ? "succeeded" : status === "aborted" ? "interrupted" : "failed"
+    child.info.outcome = outcome
+    child.info.time.idle = Date.now()
+    const type =
+      outcome === "succeeded"
+        ? "session.execution.succeeded"
+        : outcome === "interrupted"
+          ? "session.execution.interrupted"
+          : "session.execution.failed"
+    this.#emit(child, {
+      id: eventID(),
+      created: Date.now(),
+      type,
+      location: child.info.location,
+      data:
+        type === "session.execution.failed"
+          ? { sessionID: child.id, error: { type: "task", message: "subagent failed" } }
+          : type === "session.execution.interrupted"
+            ? { sessionID: child.id, reason: "user" }
+            : { sessionID: child.id },
+      durable: { aggregateID: child.id, seq: nextSeq(child), version: 1 },
+    })
+  }
+
+  #childRuntime(parent: Runtime, id: string, payload: Record<string, unknown>): Runtime | undefined {
+    if (!id) return undefined
+    parent.children ??= new Map()
+    const existing = parent.children.get(id)
+    if (existing) return existing
+    const now = Date.now()
+    const info: SessionInfo = {
+      id,
+      parentID: parent.info.id,
+      projectID: parent.info.projectID,
+      agent: typeof payload.agent === "string" ? payload.agent : "task",
+      cost: 0,
+      tokens: emptyTokens(),
+      time: { created: now, updated: now },
+      location: parent.info.location,
+      ...(typeof payload.description === "string" ? { title: payload.description } : {}),
+      ...(parent.info.model ? { model: parent.info.model } : {}),
+    }
+    const child: Runtime = { info, messages: [] }
+    child.translator = new EventTranslator({
+      sessionID: id,
+      directory: parent.info.location.directory,
+      projectID: parent.info.projectID,
+      agent: info.agent ?? "task",
+      model: parent.info.model ?? { providerID: "unknown", id: "unknown" },
+    })
+    parent.children.set(id, child)
+    this.#runtimes.set(id, child)
+    this.#store.save(id, { info, messages: [] })
+    this.#publish(
+      child,
+      "session.created",
+      {
+        sessionID: id,
+        parentID: parent.info.id,
+        projectID: info.projectID,
+        location: info.location,
+        slug: "",
+        version: "openpi",
+        ...(info.agent ? { agent: info.agent } : {}),
+        ...(info.title ? { title: info.title } : {}),
+        ...(info.model ? { model: info.model } : {}),
+      },
+      1,
+    )
+    return child
   }
 
   #engineFailure(rt: Runtime, error: unknown): void {

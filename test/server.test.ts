@@ -37,7 +37,7 @@ test("a prompt streams assistant text over SSE and persists the transcript", asy
     assert.ok(types.filter((t) => t === "session.text.delta").length > 0, "text streamed")
 
     const text = seen
-      .filter((event) => event.type === "session.text.delta")
+      .filter((event) => event.type === "session.text.delta" && event.data.sessionID === id)
       .map((event) => event.data.delta)
       .join("")
     assert.ok(text.length > 0, "accumulated assistant text")
@@ -92,6 +92,47 @@ test("honors client-supplied session and message ids", async () => {
       data: { id: string; type: string }[]
     }
     assert.ok(messages.data.some((message) => message.id === "msg_client" && message.type === "user"))
+  } finally {
+    await app.close()
+  }
+})
+
+test("an OMP subagent is exposed as an OpenCode child session", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  const app = createApp({
+    directory: dir,
+    dataDir: dir,
+    storePath: join(dir, "openpi.db"),
+    ompCommand: process.execPath,
+    ompArgs: [FAKE_OMP],
+  })
+  await app.listen(0, "127.0.0.1")
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
+  try {
+    const created = (await api(base, "POST", "/api/session", { id: "ses_parent" })) as { data: { id: string } }
+    const controller = new AbortController()
+    const events = collect(await sse(base, controller.signal))
+
+    await api(base, "POST", "/api/session/ses_parent/prompt", { text: "go" })
+    await events.until("session.execution.succeeded", 20000)
+
+    const children = (await api(base, "GET", "/api/session?parentID=ses_parent")) as {
+      data: { id: string; parentID?: string }[]
+    }
+    const child = children.data.find((session) => session.id === "FitPanther")
+    assert.ok(child, "child session listed under the parent")
+    assert.equal(child.parentID, "ses_parent")
+
+    const messages = (await api(base, "GET", "/api/session/FitPanther/message")) as {
+      data: { type: string; content?: { text?: string }[] }[]
+    }
+    const text = messages.data
+      .filter((message) => message.type === "assistant")
+      .flatMap((message) => message.content ?? [])
+      .map((part) => part.text)
+      .join("")
+    assert.equal(text, "sub result")
+    controller.abort()
   } finally {
     await app.close()
   }

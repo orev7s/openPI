@@ -63,6 +63,9 @@ async function handle(frame) {
     case "open_session":
       respond({ ok: true })
       return
+    case "set_subagent_subscription":
+      respond({ level: frame.level })
+      return
     case "prompt":
       respond({ agentInvoked: true })
       void runPrompt(frame.id)
@@ -92,6 +95,25 @@ async function runPrompt(id) {
   emit({ type: "message_update", message, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: text } })
   await sleep(2)
   emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } })
+  await sleep(2)
+  const child = "FitPanther"
+  emit({ type: "subagent_lifecycle", payload: { id: child, agent: "task", status: "started", index: 0, description: "child work" } })
+  await sleep(2)
+  emit({ type: "subagent_event", payload: { id: child, event: { type: "agent_start" } } })
+  await sleep(2)
+  emit({ type: "subagent_event", payload: { id: child, event: { type: "message_start", message } } })
+  await sleep(2)
+  emit({ type: "subagent_event", payload: { id: child, event: { type: "message_update", message, assistantMessageEvent: { type: "text_start", contentIndex: 0 } } } })
+  await sleep(2)
+  emit({ type: "subagent_event", payload: { id: child, event: { type: "message_update", message, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "sub result" } } } })
+  await sleep(2)
+  emit({ type: "subagent_event", payload: { id: child, event: { type: "message_update", message, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "sub result" } } } })
+  await sleep(2)
+  emit({ type: "subagent_event", payload: { id: child, event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "sub result" }] } } } })
+  await sleep(2)
+  emit({ type: "subagent_event", payload: { id: child, event: { type: "agent_end", yielded: true } } })
+  await sleep(2)
+  emit({ type: "subagent_lifecycle", payload: { id: child, agent: "task", status: "completed", index: 0 } })
   await sleep(2)
   emit({ type: "agent_end", yielded: true })
   await sleep(2)

@@ -109,9 +109,11 @@ function listSessions(ctx: RouteContext): unknown[] {
   const order = ctx.url.searchParams.get("order") ?? "desc"
   const limit = Number(ctx.url.searchParams.get("limit") ?? "0")
   let sessions = ctx.manager.listSessions() as Record<string, unknown>[]
-  if (parentID !== null) {
-    // openPI never creates child sessions, so a parent filter matches nothing.
-    sessions = parentID === "null" ? sessions : []
+  if (parentID === null || parentID === "null") {
+    // Default listing is root sessions; children appear under their parent.
+    sessions = sessions.filter((session) => !session.parentID)
+  } else {
+    sessions = sessions.filter((session) => session.parentID === parentID)
   }
   if (order === "asc") sessions = [...sessions].reverse()
   if (Number.isFinite(limit) && limit > 0) sessions = sessions.slice(0, limit)
