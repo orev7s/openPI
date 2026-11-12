@@ -238,7 +238,18 @@ export class Manager {
     rt.info.time.updated = Date.now()
     this.#persist(rt)
     this.#publish(rt, "session.model.selected", { sessionID: id, model: ref }, 1)
-    if (rt.omp) await rt.omp.send({ type: "set_model", provider: ref.providerID, modelId: ref.id }).catch(() => undefined)
+    if (rt.omp) {
+      await rt.omp.send({ type: "set_model", provider: ref.providerID, modelId: ref.id }).catch(() => undefined)
+      await this.#applyVariant(rt)
+    }
+  }
+
+  // The UI's effort menu sends a model variant; OMP's equivalent is the
+  // thinking level, whose names match the variants we advertise.
+  async #applyVariant(rt: Runtime): Promise<void> {
+    const variant = rt.info.model?.variant
+    if (!rt.omp || !variant || variant === "default") return
+    await rt.omp.send({ type: "set_thinking_level", level: variant }).catch(() => undefined)
   }
 
   async close(): Promise<void> {
@@ -299,6 +310,7 @@ export class Manager {
       await omp
         .send({ type: "set_model", provider: rt.info.model.providerID, modelId: rt.info.model.id })
         .catch(() => undefined)
+      await this.#applyVariant(rt)
     }
   }
 
@@ -669,6 +681,7 @@ function findTool(assistant: { content: any[] } | undefined, id: unknown): any {
 function toModelInfo(model: Record<string, any>): Record<string, unknown> {
   const input: string[] = Array.isArray(model.input) ? model.input : ["text"]
   const cost = model.cost ?? {}
+  const efforts: string[] = Array.isArray(model.thinking?.efforts) ? model.thinking.efforts.filter((e: unknown) => typeof e === "string") : []
   return {
     id: model.id,
     modelID: model.id,
@@ -679,8 +692,8 @@ function toModelInfo(model: Record<string, any>): Record<string, unknown> {
     package: model.api ?? "omp",
     settings: {},
     headers: {},
-    capabilities: { tools: true, input, output: ["text"], temperature: false },
-    variants: [],
+    capabilities: { tools: true, input, output: ["text"], temperature: false, reasoning: model.reasoning === true },
+    variants: efforts.map((id) => ({ id, settings: {} })),
     time: { released: 0 },
     cost: [
       {
