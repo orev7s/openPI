@@ -55,6 +55,7 @@ async function handle(frame) {
         isStreaming: false,
         messageCount: 0,
         protocolVersion: negotiatedVersion,
+        argv: process.argv.slice(2),
       })
       return
     case "set_model":

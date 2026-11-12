@@ -91,6 +91,18 @@ User message:
 { "id":"msg_...", "type":"user", "time":{"created":0}, "text":"hi", "files":[], "agents":[], "skills":[] }
 ```
 
+Prompt `files` arrive as `PromptInput.FileAttachment` (`{ uri, name? }`).
+openPI resolves the `uri` (`data:` inline, `file:`, or a filesystem path)
+into base64 bytes once, so the message's `files` become the decodable
+`Prompt.FileAttachment` shape `{ data, mime, source }`. Image attachments are
+forwarded to OMP on the prompt as `ImageContent[]`; non-image attachments are
+appended to the model message as text. See src/core/attachments.ts.
+
+Transcripts stored before attachments were materialized keep the raw
+`PromptInput.FileAttachment` and crash the UI (`mime` is absent). The manager
+repairs those user messages when a session is first loaded and saves the
+upgraded record; an attachment it can no longer read is dropped.
+
 Assistant message:
 
 ```json
@@ -227,6 +239,7 @@ src/omp/map.ts        EventTranslator: OMP event -> OpenCode event envelope
 src/core/feed.ts      global SSE feed, one encoded frame, per-connection queues
 src/core/store.ts     sessions + messages (node:sqlite)
 src/core/ids.ts       evt_/msg_/ses_ id generation
+src/core/attachments.ts prompt attachment URIs -> UI file shape + OMP images
 src/core/manager.ts   session <-> OMP process lifecycle and projection
 src/server/routes.ts  HTTP routes openPI owns
 src/server/proxy.ts   static + API passthrough to upstream

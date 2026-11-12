@@ -83,3 +83,20 @@ test("close is idempotent", async () => {
   const exit = await client.exited
   assert.equal(exit.code, 0)
 })
+
+test("resume adds --continue to the session-dir invocation", async () => {
+  const client = await startOmp({
+    command: process.execPath,
+    args: [fakeOmp],
+    cwd: process.cwd(),
+    sessionDir: "/tmp/openpi-resume",
+    resume: true,
+  })
+  await client.ready
+  const state = (await client.send({ type: "get_state" })) as OmpResponse
+  const argv = (state.data as { argv: string[] }).argv
+  assert.ok(argv.includes("--session-dir"), `expected --session-dir in ${argv.join(" ")}`)
+  assert.ok(argv.includes("--continue"), `expected --continue in ${argv.join(" ")}`)
+  await client.close()
+  await client.exited
+})

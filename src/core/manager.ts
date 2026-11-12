@@ -2,6 +2,7 @@ import { join } from "node:path"
 import { startOmp } from "../omp/client.ts"
 import { EventTranslator } from "../omp/map.ts"
 import type { OmpClient, OmpEvent, SessionEventEnvelope } from "../omp/types.ts"
+import { materializeAttachments, repairStoredMessages } from "./attachments.ts"
 import { Feed } from "./feed.ts"
 import { eventID, messageID, sessionID } from "./ids.ts"
 import { Store } from "./store.ts"
@@ -186,9 +187,12 @@ export class Manager {
 
     const inboxID = body.id ?? messageID()
     const created = Date.now()
+    // Resolve attachment URIs once: the stored/emitted message needs the
+    // UI's `{ data, mime, source }` shape, and OMP needs the images.
+    const attachments = await materializeAttachments(body.files ?? [], rt.info.location.directory)
     const payload: Record<string, unknown> = {
       text: body.text,
-      ...(body.files ? { files: body.files } : {}),
+      ...(attachments.files.length > 0 ? { files: attachments.files } : {}),
       ...(body.agents ? { agents: body.agents } : {}),
       ...(body.skills ? { skills: body.skills } : {}),
       ...(body.metadata ? { metadata: body.metadata } : {}),
@@ -201,7 +205,7 @@ export class Manager {
       type: "user",
       time: { created },
       text: body.text,
-      files: body.files ?? [],
+      files: attachments.files,
       agents: body.agents ?? [],
       skills: body.skills ?? [],
     })
@@ -212,7 +216,12 @@ export class Manager {
 
     const streamingBehavior = body.delivery === "steer" ? "steer" : "followUp"
     void rt.omp!
-      .send({ type: "prompt", message: body.text, streamingBehavior })
+      .send({
+        type: "prompt",
+        message: body.text + attachments.context,
+        ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
+        streamingBehavior,
+      })
       .then((response) => {
         if (!response.success) this.#engineFailure(rt, new Error(response.error ?? "prompt rejected"))
       })
@@ -223,9 +232,31 @@ export class Manager {
 
   async interrupt(id: string): Promise<void> {
     const rt = this.#runtime(id)
-    if (!rt?.omp) return
-    for (const envelope of rt.translator?.interrupted() ?? []) this.#emit(rt, envelope)
-    await rt.omp.send({ type: "abort" }).catch(() => undefined)
+    if (!rt) return
+    if (rt.omp && rt.translator) {
+      for (const envelope of rt.translator.interrupted()) this.#emit(rt, envelope)
+      const stopped = await rt.omp.send({ type: "abort" }).then(() => true).catch(() => false)
+      if (stopped) return
+      rt.omp = undefined
+    }
+    // No live engine to abort (a shutdown left the turn open): close it out so
+    // the UI leaves the running state instead of offering a stop that cannot work.
+    this.#settleOpenTurn(rt, "shutdown")
+  }
+
+  // A turn cut off by a shutdown has no engine behind it. Append an interrupted
+  // idle so the transcript (and any client that reloads it) stops at a turn end.
+  #settleOpenTurn(rt: Runtime, reason: string): void {
+    const last = rt.messages[rt.messages.length - 1]
+    if (!last || last.type === "idle") return
+    this.#emit(rt, {
+      id: eventID(),
+      created: Date.now(),
+      type: "session.execution.interrupted",
+      location: rt.info.location,
+      data: { sessionID: rt.info.id, reason },
+      durable: { aggregateID: rt.info.id, seq: nextSeq(rt), version: 1 },
+    })
   }
 
   cancelInbox(id: string, inboxID: string): boolean {
@@ -305,6 +336,7 @@ export class Manager {
       args: this.#args,
       cwd: rt.info.location.directory,
       sessionDir,
+      resume: true,
     })
     rt.omp = omp
     rt.engineError = undefined
@@ -545,7 +577,14 @@ export class Manager {
     const record = this.#store.load(id)
     if (!record) return undefined
     const rt: Runtime = { info: record.info as unknown as SessionInfo, messages: record.messages }
+    // Transcripts written before attachments were materialized hold raw
+    // `{ uri }` files that crash the UI; upgrade them once, in place.
+    if (repairStoredMessages(rt.messages, rt.info.location?.directory ?? this.#directory)) {
+      this.#store.save(id, { info: rt.info, messages: rt.messages })
+    }
     this.#runtimes.set(id, rt)
+    // A turn left open by a previous shutdown has no engine behind it.
+    this.#settleOpenTurn(rt, "shutdown")
     return rt
   }
 }

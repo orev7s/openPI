@@ -26,6 +26,7 @@ export async function startOmp(options: OmpClientOptions): Promise<OmpClient> {
   const command = options.command ?? "omp"
   const ompFlags = ["--mode", "rpc"]
   if (options.sessionDir) ompFlags.push("--session-dir", options.sessionDir)
+  if (options.resume && options.sessionDir) ompFlags.push("--continue")
   const extra = options.args ?? []
   // A Node executable running a JavaScript entrypoint (tests use one in place
   // of the real omp binary) rejects unknown options placed before its script,

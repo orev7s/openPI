@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { AddressInfo } from "node:net"
 import { createApp } from "../src/server/app.ts"
+import { Store } from "../src/core/store.ts"
 import type { SessionEventEnvelope } from "../src/omp/types.ts"
 
 const FAKE_OMP = new URL("./helpers/fake-omp.mjs", import.meta.url).pathname
@@ -249,6 +250,92 @@ test("an unnamed first prompt retries the title on a later prompt", async () => 
     const seen = await events.until("session.renamed", 20000)
     assert.equal(seen.find((event) => event.type === "session.renamed")?.data.title, "Second prompt title")
     controller.abort()
+  } finally {
+    await app.close()
+  }
+})
+
+test("an attached picture is materialized for the UI and does not break the session", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  const app = appWith(dir)
+  await app.listen(0, "127.0.0.1")
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+  const expected = { data: png, mime: "image/png", source: { type: "inline" }, name: "red.png" }
+
+  try {
+    const created = (await api(base, "POST", "/api/session", { id: "ses_pic" })) as { data: { id: string } }
+    assert.equal(created.data.id, "ses_pic")
+
+    const controller = new AbortController()
+    const events = collect(await sse(base, controller.signal))
+
+    await api(base, "POST", "/api/session/ses_pic/prompt", {
+      text: "what color is this?",
+      files: [{ uri: `data:image/png;base64,${png}`, name: "red.png" }],
+    })
+    const seen = await events.until("session.execution.succeeded", 20000)
+    assert.ok(seen.some((event) => event.type === "session.text.delta"), "the turn still streamed")
+    controller.abort()
+
+    const enqueued = seen.find((event) => event.type === "session.inbox.enqueued") as
+      | { data: { item: { payload: { files: unknown[] } } } }
+      | undefined
+    assert.ok(enqueued, "inbox enqueued event emitted")
+    assert.deepEqual(enqueued.data.item.payload.files, [expected], "inbox payload carries the decodable attachment")
+
+    const messages = (await api(base, "GET", "/api/session/ses_pic/message")) as {
+      data: { type: string; files?: unknown[] }[]
+    }
+    const user = messages.data.find((message) => message.type === "user")
+    assert.deepEqual(user?.files, [expected], "persisted user message carries the decodable attachment")
+  } finally {
+    await app.close()
+  }
+})
+
+test("a turn left open by a shutdown is settled on load", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  const storePath = join(dir, "openpi.db")
+  const now = Date.now()
+  const store = new Store(storePath)
+  store.save("ses_open", {
+    info: {
+      id: "ses_open",
+      projectID: "proj_open",
+      agent: "build",
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      time: { created: now, updated: now },
+      location: { directory: dir },
+    },
+    messages: [
+      { id: "msg_u", type: "user", time: { created: now }, text: "hi", files: [], agents: [], skills: [] },
+      {
+        id: "msg_a",
+        type: "assistant",
+        time: { created: now },
+        agent: "build",
+        model: { providerID: "p", id: "m" },
+        content: [],
+      },
+    ],
+  })
+  store.close()
+
+  const app = appWith(dir)
+  await app.listen(0, "127.0.0.1")
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
+  try {
+    const first = (await api(base, "GET", "/api/session/ses_open/message")) as {
+      data: { type: string; outcome?: string }[]
+    }
+    const idles = first.data.filter((message) => message.type === "idle")
+    assert.equal(idles.length, 1, "exactly one idle is appended")
+    assert.equal(idles[0].outcome, "interrupted")
+
+    const again = (await api(base, "GET", "/api/session/ses_open/message")) as { data: { type: string }[] }
+    assert.equal(again.data.filter((message) => message.type === "idle").length, 1, "settling runs once")
   } finally {
     await app.close()
   }

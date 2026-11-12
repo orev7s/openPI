@@ -123,6 +123,21 @@ One small fix worth calling out: OMP sends edit arguments as `old_string` and
 `new_string`, but the OpenCode editor reads `oldString` and `newString`. openPI
 translates those too, otherwise every edit would render as an empty diff.
 
+## Attachments
+
+The composer sends an attachment as a `uri` (an inline `data:` URL, a `file:`
+URL, or a path). openPI resolves it once into base64 bytes: the persisted user
+message and the `session.inbox.enqueued` event carry the `{ data, mime, source }`
+shape the UI decodes, and image attachments are passed to OMP on the prompt.
+Anything else is appended to the model prompt as text, so a picture, a PDF or a
+source file all reach the engine instead of being silently dropped.
+
+Sessions written before this existed stored the raw `{ uri }` and would crash
+the UI on open. openPI repairs those transcripts the first time they are loaded
+and persists the upgraded messages, so an old session recovers instead of
+having to be recreated. An attachment that can no longer be read (a directory
+mention, a deleted file) is dropped rather than left in the broken shape.
+
 ## Session titles
 
 OMP disables its own title generation when it runs in RPC mode, so sessions would

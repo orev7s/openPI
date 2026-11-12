@@ -38,6 +38,8 @@ export interface OmpStartOptions {
   cwd: string
   /** Per-session directory so OMP keeps conversations apart. */
   sessionDir?: string
+  /** Resume the newest session in `sessionDir` (`omp --continue`). */
+  resume?: boolean
   env?: Record<string, string | undefined>
 }
 
