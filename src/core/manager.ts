@@ -598,7 +598,8 @@ function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void 
     }
     case "session.tool.progress": {
       const tool = findTool(findAssistant(), data.id)
-      if (tool && tool.state.status === "running") tool.state.metadata = { ...(tool.state.metadata ?? {}), ...(data.metadata ?? {}) }
+      if (tool)
+        tool.state.metadata = { ...(tool.state.metadata ?? {}), ...(data.metadata ?? {}) }
       break
     }
     case "session.tool.success": {

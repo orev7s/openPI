@@ -181,6 +181,12 @@ Agent events (`packages/agent/src/types.ts`):
 | abort command | `session.execution.interrupted` |
 | notice level=error | `session.execution.failed` |
 
+OMP tool names are normalized to the names the OpenCode UI renders specially:
+`bash` -> `shell`, `task` -> `subagent`. A running subagent tool is linked to
+its child session by emitting `session.tool.progress` with
+`metadata.sessionID`, which is what the UI reads to open the subagent. Unknown
+session sub-resources answer with safe defaults so the UI never 404s.
+
 ## Milestones
 
 1. **Foundation (this):** repo, contract docs, OMP RPC client with protocol v2
