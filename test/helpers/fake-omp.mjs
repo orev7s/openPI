@@ -7,6 +7,10 @@ import readline from "node:readline"
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const emit = (frame) => process.stdout.write(JSON.stringify(frame) + "\n")
 
+const argv = process.argv.slice(2)
+const scenarioIndex = argv.indexOf("--scenario")
+const scenario = scenarioIndex === -1 ? "default" : (argv[scenarioIndex + 1] ?? "default")
+
 let negotiatedVersion = 1
 
 emit({
@@ -80,6 +84,8 @@ async function handle(frame) {
 }
 
 async function runPrompt(id) {
+  if (scenario === "error") return runErrorPrompt(id)
+  if (scenario === "unknown-tool") return runUnknownToolPrompt(id)
   const text = "Hello fake omp"
   const message = { role: "assistant", content: [] }
   emit({ type: "agent_start" })
@@ -118,6 +124,63 @@ async function runPrompt(id) {
   emit({ type: "agent_end", yielded: true })
   await sleep(2)
   emit({ type: "prompt_result", promptId: id, status: "completed" })
+  await sleep(2)
+  emit({ type: "session_settled" })
+}
+
+// A model/provider failure ends the run without yielding; only prompt_result
+// carries the error.
+async function runErrorPrompt(id) {
+  const message = { role: "assistant", content: [] }
+  emit({ type: "agent_start" })
+  await sleep(2)
+  emit({ type: "message_start", message })
+  await sleep(2)
+  emit({ type: "message_update", message, assistantMessageEvent: { type: "text_start", contentIndex: 0 } })
+  await sleep(2)
+  emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "trying" } })
+  await sleep(2)
+  emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error" } })
+  await sleep(2)
+  emit({ type: "agent_end", yielded: true })
+  await sleep(2)
+  emit({
+    type: "prompt_result",
+    promptId: id,
+    agentInvoked: true,
+    status: "error",
+    error: { message: "provider exploded", retryable: false },
+    sessionSettled: true,
+  })
+  await sleep(2)
+  emit({ type: "session_settled" })
+}
+
+// A custom tool that runs without any streamed toolcall_* input.
+async function runUnknownToolPrompt(id) {
+  const message = { role: "assistant", content: [] }
+  emit({ type: "agent_start" })
+  await sleep(2)
+  emit({ type: "message_start", message })
+  await sleep(2)
+  emit({ type: "message_update", message, assistantMessageEvent: { type: "text_start", contentIndex: 0 } })
+  await sleep(2)
+  emit({ type: "message_update", message, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "ran a tool" } })
+  await sleep(2)
+  emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ran a tool" }] } })
+  await sleep(2)
+  emit({ type: "tool_execution_start", toolCallId: "call_eval", toolName: "eval", args: { language: "py", code: "print(1)" } })
+  await sleep(2)
+  emit({
+    type: "tool_execution_end",
+    toolCallId: "call_eval",
+    result: { content: [{ type: "text", text: "1" }], details: {} },
+    isError: false,
+  })
+  await sleep(2)
+  emit({ type: "agent_end", yielded: true })
+  await sleep(2)
+  emit({ type: "prompt_result", promptId: id, agentInvoked: true, status: "completed", sessionSettled: true })
   await sleep(2)
   emit({ type: "session_settled" })
 }

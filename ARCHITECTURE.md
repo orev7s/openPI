@@ -178,14 +178,32 @@ Agent events (`packages/agent/src/types.ts`):
 | tool_execution_update | `session.tool.progress` |
 | tool_execution_end | `session.tool.success` / `session.tool.failed` |
 | agent_end (yielded) | `session.execution.succeeded` + idle message |
+| prompt_result (terminal) | `session.execution.succeeded` / `failed` / `interrupted` |
 | abort command | `session.execution.interrupted` |
 | notice level=error | `session.execution.failed` |
+| session_info_update / setTitle | `session.renamed` |
+
+`prompt_result` is the authoritative end of a turn. A yielded `agent_end`
+already ends it, but a provider/model error arrives only in `prompt_result`, so
+the translator tracks the assistant message's stop reason and lets that frame
+emit `session.execution.failed` instead of leaving the UI on "working".
 
 OMP tool names are normalized to the names the OpenCode UI renders specially:
-`bash` -> `shell`, `task` -> `subagent`. A running subagent tool is linked to
-its child session by emitting `session.tool.progress` with
+`bash` -> `shell`, `task` -> `subagent`, `eval` -> `execute`, `web_search` ->
+`websearch`. The OpenCode UI only richly renders tool names it ships a renderer
+for, so a tool with no known name is mapped to a renderer by the shape of its
+input (`command` -> shell, `code` -> execute, `url` -> webfetch, `query` ->
+websearch, `pattern` -> grep, `path` -> read/write/edit) and keeps the others
+generic. OMP's `edit` args are also translated from `old_string`/`new_string` to
+the `oldString`/`newString` the renderer reads. A running subagent tool is
+linked to its child session by emitting `session.tool.progress` with
 `metadata.sessionID`, which is what the UI reads to open the subagent. Unknown
 session sub-resources answer with safe defaults so the UI never 404s.
+
+OMP forces `PI_NO_TITLE=1` in RPC mode, so it never names a session. openPI
+generates the title itself on the first prompt with one short out-of-band
+`omp -p` call and publishes `session.renamed`; a `session_info_update` or
+`setTitle` frame is honored if the engine ever sends one.
 
 ## Milestones
 

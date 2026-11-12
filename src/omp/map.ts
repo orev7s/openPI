@@ -72,10 +72,62 @@ function textOf(result: unknown): string {
 }
 
 // OMP tool names differ from the ones the OpenCode UI renders specially.
-const TOOL_NAME_MAP: Record<string, string> = { bash: "shell", task: "subagent" }
+const TOOL_NAME_MAP: Record<string, string> = {
+  bash: "shell",
+  task: "subagent",
+  eval: "execute",
+  web_search: "websearch",
+}
 
-function normalizeToolName(name: string): string {
-  return TOOL_NAME_MAP[name] ?? name
+// Renderer names the OpenCode UI knows. Anything else falls back to a generic
+// card that shows the tool name and input summary but hides the output, so an
+// unrecognized tool is matched to a renderer by the shape of its input.
+const RENDERER_NAMES = new Set([
+  "read",
+  "list",
+  "glob",
+  "grep",
+  "webfetch",
+  "websearch",
+  "subagent",
+  "execute",
+  "shell",
+  "edit",
+  "write",
+  "patch",
+  "question",
+  "skill",
+])
+
+// OpenCode's edit renderer reads camelCase fields; OMP's edit args are snake_case.
+function normalizeToolInput(name: string, input: Record<string, unknown>): Record<string, unknown> {
+  if (name !== "edit") return input
+  return {
+    ...input,
+    ...(typeof input.old_string === "string" && input.oldString === undefined ? { oldString: input.old_string } : {}),
+    ...(typeof input.new_string === "string" && input.newString === undefined ? { newString: input.new_string } : {}),
+    ...(typeof input.replace_all === "boolean" && input.replaceAll === undefined ? { replaceAll: input.replace_all } : {}),
+  }
+}
+
+// The name the UI keys its renderer on. Known OMP names map directly; anything
+// else (a user-authored tool, an MCP tool) is inferred from its input so its
+// code, command, path or query still renders together with its output.
+export function rendererName(name: string, input: Record<string, unknown>): string {
+  const mapped = TOOL_NAME_MAP[name]
+  if (mapped) return mapped
+  if (RENDERER_NAMES.has(name)) return name
+  if (typeof input.command === "string") return "shell"
+  if (typeof input.code === "string") return "execute"
+  if (typeof input.url === "string") return "webfetch"
+  if (typeof input.query === "string") return "websearch"
+  if (typeof input.pattern === "string") return "grep"
+  if (typeof input.path === "string") {
+    if (typeof input.content === "string") return "write"
+    if (typeof input.old_string === "string" || typeof input.oldString === "string") return "edit"
+    return "read"
+  }
+  return name
 }
 
 interface ToolCallRef {
@@ -98,6 +150,11 @@ export class EventTranslator {
   private readonly toolCalls = new Map<string, { name: string; input: string; args: unknown }>()
   private readonly indexToCallID = new Map<number, string>()
   private readonly toolAssistant = new Map<string, string>()
+  // A turn ends exactly once: agent_end (yielded) or a terminal prompt_result.
+  private turnTerminal = false
+  // The current run's provider/model outcome, so an error stop is not mistaken
+  // for a successful yield when agent_end arrives.
+  private turnErrored = false
 
   constructor(opts: TranslatorOptions) {
     this.sessionID = opts.sessionID
@@ -122,6 +179,8 @@ export class EventTranslator {
   translate(event: OmpEvent): SessionEventEnvelope[] {
     switch (event.type) {
       case "agent_start":
+        this.turnTerminal = false
+        this.turnErrored = false
         return [this.durable("session.execution.started", {})]
       case "message_start":
         return this.onMessageStart(event)
@@ -136,7 +195,14 @@ export class EventTranslator {
       case "tool_execution_end":
         return this.onToolExecutionEnd(event)
       case "agent_end":
-        return event.yielded === false ? [] : [this.durable("session.execution.succeeded", {})]
+        if (event.yielded === false) return []
+        // An errored run reports its message through prompt_result; emitting
+        // success here would end the turn before that error arrives.
+        if (this.turnErrored) return []
+        this.turnTerminal = true
+        return [this.durable("session.execution.succeeded", {})]
+      case "prompt_result":
+        return this.onPromptResult(event)
       case "notice":
         return this.onNotice(event)
       default:
@@ -146,6 +212,7 @@ export class EventTranslator {
 
   /** Emitted when the caller issues an abort. */
   interrupted(): SessionEventEnvelope[] {
+    this.turnTerminal = true
     return [this.durable("session.execution.interrupted", { reason: "user" })]
   }
 
@@ -267,7 +334,7 @@ export class EventTranslator {
           this.durable("session.tool.input.started", {
             assistantMessageID: assistantID,
             id: call.id,
-            name: normalizeToolName(call.name),
+            name: rendererName(call.name, asRecord(call.arguments)),
           }),
         ]
       }
@@ -308,10 +375,12 @@ export class EventTranslator {
     if (!assistantID || !message || message.role !== "assistant") return []
     const usage = message.usage ?? {}
     const cost = usage.cost as { total?: unknown } | undefined
+    const finish = mapFinish(message.stopReason)
+    if (finish === "error") this.turnErrored = true
     return [
       this.durable("session.step.ended", {
         assistantMessageID: assistantID,
-        finish: mapFinish(message.stopReason),
+        finish,
         cost: typeof cost?.total === "number" ? cost.total : 0,
         tokens: {
           input: typeof usage.input === "number" ? usage.input : 0,
@@ -330,16 +399,16 @@ export class EventTranslator {
     const assistantID = this.assistantID
     const id = event.toolCallId
     if (!assistantID || typeof id !== "string") return []
-    const name = normalizeToolName(typeof event.toolName === "string" ? event.toolName : "")
+    const rawName = typeof event.toolName === "string" ? event.toolName : ""
     const input = asRecord(event.args)
     this.toolAssistant.set(id, assistantID)
-    this.toolCalls.set(id, { name, input: "", args: input })
+    this.toolCalls.set(id, { name: rawName, input: "", args: input })
     return [
       this.durable("session.tool.called", {
         assistantMessageID: assistantID,
         id,
-        name,
-        input,
+        name: rendererName(rawName, input),
+        input: normalizeToolInput(rawName, input),
         executed: true,
       }),
     ]
@@ -391,7 +460,26 @@ export class EventTranslator {
     if (event.level !== "error") return []
     const message = typeof event.message === "string" ? event.message : "Agent error"
     const type = typeof event.source === "string" ? event.source : "unknown"
+    this.turnTerminal = true
     return [this.durable("session.execution.failed", { error: { type, message } })]
+  }
+
+  // OMP's terminal frame for an accepted prompt. A yielded agent_end already
+  // ends the turn; this is the safety net that also surfaces provider errors
+  // and aborts, so the UI never sits on "working" after a failed turn.
+  private onPromptResult(event: OmpEvent): SessionEventEnvelope[] {
+    if (this.turnTerminal) return []
+    if (event.agentInvoked === false) return []
+    this.turnTerminal = true
+    const status = typeof event.status === "string" ? event.status : "completed"
+    if (status === "error") {
+      const error = event.error as { message?: unknown; httpStatus?: unknown } | undefined
+      const message = typeof error?.message === "string" && error.message ? error.message : "The model request failed"
+      const httpStatus = typeof error?.httpStatus === "number" ? { status: error.httpStatus } : {}
+      return [this.durable("session.execution.failed", { error: { type: "provider", message, ...httpStatus } })]
+    }
+    if (status === "aborted") return [this.durable("session.execution.interrupted", { reason: "user" })]
+    return [this.durable("session.execution.succeeded", {})]
   }
 
   private textOrdinalFor(index: number): number {

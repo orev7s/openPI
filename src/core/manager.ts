@@ -5,6 +5,7 @@ import type { OmpClient, OmpEvent, SessionEventEnvelope } from "../omp/types.ts"
 import { Feed } from "./feed.ts"
 import { eventID, messageID, sessionID } from "./ids.ts"
 import { Store } from "./store.ts"
+import { generateTitle as defaultGenerateTitle, type TitleGenerator } from "./title.ts"
 
 export interface ModelRef {
   providerID: string
@@ -45,6 +46,8 @@ export interface ManagerOptions {
   /** OMP executable, default "omp". */
   command?: string
   args?: string[]
+  /** Session title generator; defaults to a short out-of-band OMP call. */
+  generateTitle?: TitleGenerator
 }
 
 interface Runtime {
@@ -58,6 +61,7 @@ interface Runtime {
   seq?: number
   children?: Map<string, Runtime>
   linkedTools?: Set<string>
+  titleRequested?: boolean
 }
 
 const emptyTokens = (): Tokens => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
@@ -72,6 +76,7 @@ export class Manager {
   #args: string[]
   #runtimes = new Map<string, Runtime>()
   #catalog?: Promise<OmpClient>
+  #generateTitle: TitleGenerator
 
   constructor(options: ManagerOptions) {
     this.#feed = options.feed
@@ -80,6 +85,7 @@ export class Manager {
     this.#dataDir = options.dataDir
     this.#command = options.command ?? "omp"
     this.#args = options.args ?? []
+    this.#generateTitle = options.generateTitle ?? defaultGenerateTitle
   }
 
   // ---- sessions -----------------------------------------------------------
@@ -202,6 +208,7 @@ export class Manager {
     this.#publish(rt, "session.inbox.enqueued", { sessionID: id, inboxID, item }, 1)
     this.#persist(rt)
     this.#publish(rt, "session.inbox.delivered", { sessionID: id, inboxID }, 1)
+    this.#maybeGenerateTitle(rt, body.text)
 
     const streamingBehavior = body.delivery === "steer" ? "steer" : "followUp"
     void rt.omp!
@@ -252,6 +259,21 @@ export class Manager {
     await rt.omp.send({ type: "set_thinking_level", level: variant }).catch(() => undefined)
   }
 
+  // OMP disables its own title generation in RPC mode, so name the session
+  // from its first prompt the way OpenCode does: one short out-of-band call.
+  #maybeGenerateTitle(rt: Runtime, text: string): void {
+    if (rt.titleRequested || rt.info.title || !text.trim()) return
+    rt.titleRequested = true
+    // `#args` are RPC-only flags, so the title call runs the bare executable.
+    void this.#generateTitle({ command: this.#command, cwd: rt.info.location.directory, text })
+      .then((title) => {
+        if (title && !rt.info.title) this.renameSession(rt.info.id, title)
+        // Nothing to name yet (a greeting); let a later prompt try again.
+        else if (!title) rt.titleRequested = false
+      })
+      .catch(() => undefined)
+  }
+
   async close(): Promise<void> {
     await Promise.all([...this.#runtimes.values()].map((rt) => this.#stopEngine(rt)))
   }
@@ -285,6 +307,7 @@ export class Manager {
       sessionDir,
     })
     rt.omp = omp
+    rt.engineError = undefined
     let model = rt.info.model
     if (!model) {
       const state = await omp.send<{ model?: { provider?: string; id?: string } }>({ type: "get_state" }).catch(() => undefined)
@@ -303,7 +326,11 @@ export class Manager {
     })
     rt.unsubscribe = omp.onEvent((event) => this.#onEngineEvent(rt, event))
     void omp.exited.then(({ code }) => {
-      if (!rt.closing) this.#engineFailure(rt, new Error(`omp exited (${code})`))
+      if (rt.closing) return
+      // Drop the dead client so the next prompt starts a fresh engine instead
+      // of failing against a closed pipe.
+      if (rt.omp === omp) rt.omp = undefined
+      this.#engineFailure(rt, new Error(`omp exited (${code})`))
     })
     await omp.send({ type: "set_subagent_subscription", level: "events" }).catch(() => undefined)
     if (rt.info.model) {
@@ -328,10 +355,26 @@ export class Manager {
       this.#onSubagentFrame(rt, event)
       return
     }
+    if (event.type === "session_info_update" || event.type === "extension_ui_request") {
+      this.#onTitleFrame(rt, event)
+      return
+    }
     if (!rt.translator) return
     const envelopes = rt.translator.translate(event)
     if (process.env.OPENPI_DEBUG) console.log(`[omp] ${event.type} -> ${envelopes.length} event(s)`)
     for (const envelope of envelopes) this.#emit(rt, envelope)
+  }
+
+  // OMP names a session either through a state update or, when opted in, a
+  // setTitle UI request; both carry the generated title.
+  #onTitleFrame(rt: Runtime, event: OmpEvent): void {
+    const title =
+      event.type === "session_info_update"
+        ? event.title
+        : event.type === "extension_ui_request" && event.method === "setTitle"
+          ? event.title
+          : undefined
+    if (typeof title === "string" && title.trim() && title !== rt.info.title) this.renameSession(rt.info.id, title.trim())
   }
 
   // OMP task subagents become OpenCode child sessions (parentID), so the UI's
@@ -604,8 +647,11 @@ function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void 
       break
     }
     case "session.tool.called": {
-      const tool = findTool(findAssistant(), data.id)
-      if (tool) tool.state = { status: "running", input: data.input, metadata: {} }
+      const tool = ensureTool(findAssistant(), data, envelope.created)
+      if (tool) {
+        if (typeof data.name === "string" && data.name) tool.name = data.name
+        tool.state = { status: "running", input: data.input ?? {}, metadata: {} }
+      }
       break
     }
     case "session.tool.progress": {
@@ -615,7 +661,7 @@ function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void 
       break
     }
     case "session.tool.success": {
-      const tool = findTool(findAssistant(), data.id)
+      const tool = ensureTool(findAssistant(), data, envelope.created)
       if (tool)
         tool.state = {
           status: "completed",
@@ -626,7 +672,7 @@ function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void 
       break
     }
     case "session.tool.failed": {
-      const tool = findTool(findAssistant(), data.id)
+      const tool = ensureTool(findAssistant(), data, envelope.created)
       if (tool)
         tool.state = {
           status: "error",
@@ -674,6 +720,23 @@ function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void 
 
 function findTool(assistant: { content: any[] } | undefined, id: unknown): any {
   return assistant?.content.find((item) => item.type === "tool" && item.id === id)
+}
+
+// A tool that executes without a preceding streaming input (a custom or MCP
+// tool) still gets a message part so it never disappears from the transcript.
+function ensureTool(assistant: { content: any[] } | undefined, data: Record<string, any>, created: number): any {
+  const existing = findTool(assistant, data.id)
+  if (existing) return existing
+  if (!assistant || typeof data.id !== "string") return undefined
+  const tool = {
+    type: "tool",
+    id: data.id,
+    name: typeof data.name === "string" ? data.name : "tool",
+    state: { status: "streaming", input: "" },
+    time: { created },
+  }
+  assistant.content.push(tool)
+  return tool
 }
 
 // ---- model mapping --------------------------------------------------------

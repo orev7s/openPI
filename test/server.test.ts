@@ -8,16 +8,23 @@ import { createApp } from "../src/server/app.ts"
 import type { SessionEventEnvelope } from "../src/omp/types.ts"
 
 const FAKE_OMP = new URL("./helpers/fake-omp.mjs", import.meta.url).pathname
+// Title generation spawns a real omp; tests stub it out.
+const noTitle = async () => undefined
 
-test("a prompt streams assistant text over SSE and persists the transcript", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
-  const app = createApp({
+function appWith(dir: string, ompArgs: string[] = [FAKE_OMP]) {
+  return createApp({
     directory: dir,
     dataDir: dir,
     storePath: join(dir, "openpi.db"),
     ompCommand: process.execPath,
-    ompArgs: [FAKE_OMP],
+    ompArgs,
+    generateTitle: noTitle,
   })
+}
+
+test("a prompt streams assistant text over SSE and persists the transcript", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  const app = appWith(dir)
   await app.listen(0, "127.0.0.1")
   const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
 
@@ -66,13 +73,7 @@ test("a prompt streams assistant text over SSE and persists the transcript", asy
 
 test("honors client-supplied session and message ids", async () => {
   const dir = await mkdtemp(join(tmpdir(), "openpi-"))
-  const app = createApp({
-    directory: dir,
-    dataDir: dir,
-    storePath: join(dir, "openpi.db"),
-    ompCommand: process.execPath,
-    ompArgs: [FAKE_OMP],
-  })
+  const app = appWith(dir)
   await app.listen(0, "127.0.0.1")
   const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
   try {
@@ -99,13 +100,7 @@ test("honors client-supplied session and message ids", async () => {
 
 test("an OMP subagent is exposed as an OpenCode child session", async () => {
   const dir = await mkdtemp(join(tmpdir(), "openpi-"))
-  const app = createApp({
-    directory: dir,
-    dataDir: dir,
-    storePath: join(dir, "openpi.db"),
-    ompCommand: process.execPath,
-    ompArgs: [FAKE_OMP],
-  })
+  const app = appWith(dir)
   await app.listen(0, "127.0.0.1")
   const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
   try {
@@ -132,6 +127,127 @@ test("an OMP subagent is exposed as an OpenCode child session", async () => {
       .map((part) => part.text)
       .join("")
     assert.equal(text, "sub result")
+    controller.abort()
+  } finally {
+    await app.close()
+  }
+})
+
+test("a failed turn emits and persists an idle failure instead of hanging", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  const app = appWith(dir, [FAKE_OMP, "--scenario", "error"])
+  await app.listen(0, "127.0.0.1")
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
+  try {
+    await api(base, "POST", "/api/session", { id: "ses_error" })
+    const controller = new AbortController()
+    const events = collect(await sse(base, controller.signal))
+
+    await api(base, "POST", "/api/session/ses_error/prompt", { text: "trigger a provider error" })
+    await events.until("session.execution.failed", 20000)
+
+    const messages = (await api(base, "GET", "/api/session/ses_error/message")) as {
+      data: { type: string; outcome?: string; error?: { message?: string } }[]
+    }
+    const idle = messages.data.find((message) => message.type === "idle")
+    assert.ok(idle, "a failed turn still records an idle marker")
+    assert.equal(idle.outcome, "failed")
+    assert.equal(idle.error?.message, "provider exploded")
+    controller.abort()
+  } finally {
+    await app.close()
+  }
+})
+
+test("a tool without streamed input still renders with its mapped name and output", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  const app = appWith(dir, [FAKE_OMP, "--scenario", "unknown-tool"])
+  await app.listen(0, "127.0.0.1")
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
+  try {
+    await api(base, "POST", "/api/session", { id: "ses_tool" })
+    const controller = new AbortController()
+    const events = collect(await sse(base, controller.signal))
+
+    await api(base, "POST", "/api/session/ses_tool/prompt", { text: "run eval" })
+    await events.until("session.execution.succeeded", 20000)
+
+    const messages = (await api(base, "GET", "/api/session/ses_tool/message")) as {
+      data: {
+        type: string
+        content?: { type: string; name?: string; state?: { status: string; content?: { text?: string }[] } }[]
+      }[]
+    }
+    const tool = messages.data
+      .filter((message) => message.type === "assistant")
+      .flatMap((message) => message.content ?? [])
+      .find((part) => part.type === "tool")
+    assert.ok(tool, "the tool appears in the transcript")
+    assert.equal(tool.name, "execute", "eval maps to the OpenCode execute renderer")
+    assert.equal(tool.state?.status, "completed")
+    assert.equal(tool.state?.content?.[0]?.text, "1")
+    controller.abort()
+  } finally {
+    await app.close()
+  }
+})
+
+test("the first prompt names the session through the title generator", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  const app = createApp({
+    directory: dir,
+    dataDir: dir,
+    storePath: join(dir, "openpi.db"),
+    ompCommand: process.execPath,
+    ompArgs: [FAKE_OMP],
+    generateTitle: async () => "Fix retry queue job loss",
+  })
+  await app.listen(0, "127.0.0.1")
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
+  try {
+    await api(base, "POST", "/api/session", { id: "ses_title" })
+    const controller = new AbortController()
+    const events = collect(await sse(base, controller.signal))
+
+    await api(base, "POST", "/api/session/ses_title/prompt", { text: "the retry queue drops jobs" })
+    const seen = await events.until("session.renamed", 20000)
+    const renamed = seen.find((event) => event.type === "session.renamed")
+    assert.equal(renamed?.data.title, "Fix retry queue job loss")
+
+    const session = (await api(base, "GET", "/api/session/ses_title")) as { data: { title?: string } }
+    assert.equal(session.data.title, "Fix retry queue job loss")
+    controller.abort()
+  } finally {
+    await app.close()
+  }
+})
+
+test("an unnamed first prompt retries the title on a later prompt", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  let calls = 0
+  const app = createApp({
+    directory: dir,
+    dataDir: dir,
+    storePath: join(dir, "openpi.db"),
+    ompCommand: process.execPath,
+    ompArgs: [FAKE_OMP],
+    generateTitle: async () => (++calls === 1 ? undefined : "Second prompt title"),
+  })
+  await app.listen(0, "127.0.0.1")
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
+  try {
+    await api(base, "POST", "/api/session", { id: "ses_retry" })
+    const controller = new AbortController()
+    const events = collect(await sse(base, controller.signal))
+
+    await api(base, "POST", "/api/session/ses_retry/prompt", { text: "hi" })
+    await events.until("session.execution.succeeded", 20000)
+    const first = (await api(base, "GET", "/api/session/ses_retry")) as { data: { title?: string } }
+    assert.equal(first.data.title, undefined, "a greeting is not titled")
+
+    await api(base, "POST", "/api/session/ses_retry/prompt", { text: "fix the retry queue" })
+    const seen = await events.until("session.renamed", 20000)
+    assert.equal(seen.find((event) => event.type === "session.renamed")?.data.title, "Second prompt title")
     controller.abort()
   } finally {
     await app.close()

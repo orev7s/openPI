@@ -188,3 +188,81 @@ test("failed tools are durable v2 and a non-yielded agent_end is dropped", () =>
 
   assert.deepEqual(translator.translate({ type: "agent_end", messages: [], yielded: false }), [])
 })
+
+test("maps unknown tool names to a renderer by input shape and normalizes edit input", () => {
+  const translator = new EventTranslator(opts)
+  const out: SessionEventEnvelope[] = []
+  const feed = (event: OmpEvent) => out.push(...translator.translate(event))
+
+  feed({ type: "agent_start" })
+  feed({ type: "message_start", message: { role: "assistant" } })
+  feed({ type: "tool_execution_start", toolCallId: "c_eval", toolName: "eval", args: { language: "py", code: "print(1)", title: "x" } })
+  feed({ type: "tool_execution_start", toolCallId: "c_search", toolName: "web_search", args: { query: "rust" } })
+  feed({
+    type: "tool_execution_start",
+    toolCallId: "c_edit",
+    toolName: "edit",
+    args: { path: "/a.ts", old_string: "x", new_string: "y", replace_all: false },
+  })
+  feed({ type: "tool_execution_start", toolCallId: "c_custom", toolName: "run_thing", args: { command: "ls -la" } })
+
+  const called = out.filter((event) => event.type === "session.tool.called")
+  const name = (id: string) => called.find((event) => event.data.id === id)?.data.name
+  assert.equal(name("c_eval"), "execute")
+  assert.equal(name("c_search"), "websearch")
+  assert.equal(name("c_custom"), "shell")
+
+  const edit = called.find((event) => event.data.id === "c_edit")
+  assert.equal(edit?.data.name, "edit")
+  const editInput = edit?.data.input as Record<string, unknown> | undefined
+  assert.equal(editInput?.oldString, "x")
+  assert.equal(editInput?.newString, "y")
+  assert.equal(editInput?.replaceAll, false)
+})
+
+test("a failed prompt_result ends a turn exactly once with the provider error", () => {
+  const translator = new EventTranslator(opts)
+  const out: SessionEventEnvelope[] = []
+  const feed = (event: OmpEvent) => out.push(...translator.translate(event))
+
+  feed({ type: "agent_start" })
+  feed({ type: "message_start", message: { role: "assistant" } })
+  feed({ type: "message_end", message: { role: "assistant", stopReason: "error" } })
+  assert.deepEqual(
+    translator.translate({ type: "agent_end", yielded: true }),
+    [],
+    "an errored run does not yield success",
+  )
+
+  const failed = translator.translate({
+    type: "prompt_result",
+    agentInvoked: true,
+    status: "error",
+    error: { message: "provider exploded", httpStatus: 502, retryable: false },
+  })
+  assert.equal(failed.length, 1)
+  assert.equal(failed[0].type, "session.execution.failed")
+  assert.deepEqual(failed[0].data.error, { type: "provider", message: "provider exploded", status: 502 })
+
+  assert.deepEqual(
+    translator.translate({ type: "prompt_result", status: "error", error: { message: "again" } }),
+    [],
+    "the duplicate terminal frame is dropped",
+  )
+})
+
+test("a completed or aborted prompt_result ends a non-yielding turn once", () => {
+  const complete = new EventTranslator(opts)
+  complete.translate({ type: "agent_start" })
+  complete.translate({ type: "agent_end", yielded: false })
+  const succeeded = complete.translate({ type: "prompt_result", agentInvoked: true, status: "completed" })
+  assert.equal(succeeded.length, 1)
+  assert.equal(succeeded[0].type, "session.execution.succeeded")
+
+  const aborted = new EventTranslator(opts)
+  aborted.translate({ type: "agent_start" })
+  aborted.translate({ type: "agent_end", yielded: false })
+  const interrupted = aborted.translate({ type: "prompt_result", agentInvoked: true, status: "aborted" })
+  assert.equal(interrupted.length, 1)
+  assert.equal(interrupted[0].type, "session.execution.interrupted")
+})

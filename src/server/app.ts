@@ -2,6 +2,7 @@ import { createServer, type Server } from "node:http"
 import { Manager } from "../core/manager.ts"
 import { Feed } from "../core/feed.ts"
 import { Store } from "../core/store.ts"
+import type { TitleGenerator } from "../core/title.ts"
 import { handleOwned, type RouteContext } from "./routes.ts"
 import { proxy } from "./proxy.ts"
 import { sendError } from "./http.ts"
@@ -17,6 +18,7 @@ export interface AppOptions {
   ompCommand?: string
   ompArgs?: string[]
   storePath?: string
+  generateTitle?: TitleGenerator
 }
 
 export interface App {
@@ -37,6 +39,7 @@ export function createApp(options: AppOptions): App {
     dataDir: options.dataDir,
     ...(options.ompCommand ? { command: options.ompCommand } : {}),
     ...(options.ompArgs ? { args: options.ompArgs } : {}),
+    ...(options.generateTitle ? { generateTitle: options.generateTitle } : {}),
   })
   const version = options.version ?? "openpi/0.0.1"
 
