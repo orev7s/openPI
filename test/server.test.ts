@@ -64,6 +64,39 @@ test("a prompt streams assistant text over SSE and persists the transcript", asy
   }
 })
 
+test("honors client-supplied session and message ids", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openpi-"))
+  const app = createApp({
+    directory: dir,
+    dataDir: dir,
+    storePath: join(dir, "openpi.db"),
+    ompCommand: process.execPath,
+    ompArgs: [FAKE_OMP],
+  })
+  await app.listen(0, "127.0.0.1")
+  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`
+  try {
+    const created = (await api(base, "POST", "/api/session", { id: "ses_client" })) as { data: { id: string } }
+    assert.equal(created.data.id, "ses_client")
+
+    const got = (await api(base, "GET", "/api/session/ses_client")) as { data: { id: string } }
+    assert.equal(got.data.id, "ses_client")
+
+    const prompt = (await api(base, "POST", "/api/session/ses_client/prompt", {
+      id: "msg_client",
+      text: "hi",
+    })) as { data: { id: string } }
+    assert.equal(prompt.data.id, "msg_client")
+
+    const messages = (await api(base, "GET", "/api/session/ses_client/message")) as {
+      data: { id: string; type: string }[]
+    }
+    assert.ok(messages.data.some((message) => message.id === "msg_client" && message.type === "user"))
+  } finally {
+    await app.close()
+  }
+})
+
 async function api(base: string, method: string, path: string, body?: unknown): Promise<unknown> {
   const response = await fetch(base + path, {
     method,

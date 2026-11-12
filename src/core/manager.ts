@@ -21,6 +21,7 @@ export interface Tokens {
 
 export interface SessionInfo {
   id: string
+  parentID?: string
   projectID: string
   agent?: string
   model?: ModelRef
@@ -29,6 +30,8 @@ export interface SessionInfo {
   time: { created: number; updated: number; idle?: number }
   title?: string
   location: { directory: string }
+  metadata?: Record<string, unknown>
+  permissions?: unknown
   outcome?: "succeeded" | "failed" | "interrupted"
 }
 
@@ -79,20 +82,34 @@ export class Manager {
 
   // ---- sessions -----------------------------------------------------------
 
-  createSession(input: { directory?: string; location?: { directory?: string }; agent?: string; model?: ModelRef; title?: string } = {}): SessionInfo {
+  createSession(input: {
+    id?: string
+    directory?: string
+    location?: { directory?: string }
+    parentID?: string
+    agent?: string
+    model?: ModelRef
+    title?: string
+    metadata?: Record<string, unknown>
+    permissions?: unknown
+  } = {}): SessionInfo {
     const now = Date.now()
     const directory = input.directory ?? input.location?.directory ?? this.#directory
     const info: SessionInfo = {
-      id: sessionID(),
+      id: input.id ?? sessionID(),
       projectID: projectID(directory),
       agent: input.agent ?? "build",
       cost: 0,
       tokens: emptyTokens(),
       time: { created: now, updated: now },
       location: { directory },
+      ...(input.parentID ? { parentID: input.parentID } : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.title ? { title: input.title } : {}),
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+      ...(input.permissions ? { permissions: input.permissions } : {}),
     }
+    if (this.#runtimes.has(info.id)) return this.#runtimes.get(info.id)!.info
     const rt: Runtime = { info, messages: [] }
     this.#runtimes.set(info.id, rt)
     this.#store.save(info.id, { info, messages: [] })
@@ -145,19 +162,28 @@ export class Manager {
 
   async prompt(
     id: string,
-    body: { text: string; files?: unknown[]; agents?: unknown[]; skills?: unknown[]; delivery?: "steer" | "queue" },
+    body: {
+      id?: string
+      text: string
+      files?: unknown[]
+      agents?: unknown[]
+      skills?: unknown[]
+      metadata?: Record<string, unknown>
+      delivery?: "steer" | "queue"
+    },
   ): Promise<Record<string, unknown> | undefined> {
     const rt = this.#runtime(id)
     if (!rt) return undefined
     await this.#ensureEngine(rt)
 
-    const inboxID = messageID()
+    const inboxID = body.id ?? messageID()
     const created = Date.now()
     const payload: Record<string, unknown> = {
       text: body.text,
       ...(body.files ? { files: body.files } : {}),
       ...(body.agents ? { agents: body.agents } : {}),
       ...(body.skills ? { skills: body.skills } : {}),
+      ...(body.metadata ? { metadata: body.metadata } : {}),
     }
     const delivery = body.delivery ?? "queue"
     const item = { type: "user", payload, delivery }
@@ -191,6 +217,16 @@ export class Manager {
     if (!rt?.omp) return
     for (const envelope of rt.translator?.interrupted() ?? []) this.#emit(rt, envelope)
     await rt.omp.send({ type: "abort" }).catch(() => undefined)
+  }
+
+  cancelInbox(id: string, inboxID: string): boolean {
+    const rt = this.#runtime(id)
+    if (!rt) return false
+    const index = rt.messages.findIndex((message) => message.id === inboxID && message.type === "user")
+    if (index !== -1) rt.messages.splice(index, 1)
+    this.#persist(rt)
+    this.#publish(rt, "session.inbox.cancelled", { sessionID: id, inboxID }, 1)
+    return index !== -1
   }
 
   async setModel(id: string, ref: ModelRef): Promise<void> {

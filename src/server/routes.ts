@@ -182,8 +182,6 @@ async function handleSession(ctx: RouteContext, method: string): Promise<void> {
       return
     }
     case "view":
-      res.writeHead(204).end()
-      return
     case "revert":
       res.writeHead(204).end()
       return
@@ -194,12 +192,18 @@ async function handleSession(ctx: RouteContext, method: string): Promise<void> {
     case "log":
       sendJson(res, 200, { data: [] })
       return
-    default:
+    default: {
+      if (action?.startsWith("inbox/")) {
+        if (method === "DELETE") manager.cancelInbox(id, action.slice("inbox/".length))
+        res.writeHead(204).end()
+        return
+      }
       // Unknown session sub-resource: answer with a shape the UI can consume
       // instead of letting the upstream's 404 crash the app.
       if (method === "GET") sendJson(res, 200, { data: [] })
       else res.writeHead(204).end()
       return
+    }
   }
 }
 
