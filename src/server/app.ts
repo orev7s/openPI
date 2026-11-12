@@ -87,7 +87,7 @@ async function dispatch(options: DispatchOptions): Promise<void> {
   const isApi = path === "/api" || path.startsWith("/api/") || path.startsWith("/auth/") || path === "/openapi.json"
 
   if (!isApi) {
-    if (options.upstream) return proxy(req, res, options.upstream.url, options.upstreamPassword)
+    if (options.upstream) return proxy(req, res, options.upstream.url, upstreamPassword(options))
     res.writeHead(404, { "content-type": "text/plain" })
     res.end("openPI: no upstream configured, static UI unavailable\n")
     return
@@ -100,8 +100,12 @@ async function dispatch(options: DispatchOptions): Promise<void> {
 
   if (await handleOwned(options)) return
 
-  if (options.upstream) return proxy(req, res, options.upstream.url, options.upstreamPassword)
+  if (options.upstream) return proxy(req, res, options.upstream.url, upstreamPassword(options))
   sendError(res, 404, "InvalidRequestError", `No route for ${path}`)
+}
+
+function upstreamPassword(options: DispatchOptions): string | undefined {
+  return options.upstreamPassword ?? options.upstream?.password
 }
 
 function authorized(header: string | undefined, password: string): boolean {

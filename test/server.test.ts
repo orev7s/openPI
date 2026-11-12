@@ -91,23 +91,27 @@ function collect(response: Response): Collected {
   let buffer = ""
 
   void (async () => {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let index: number
-      while ((index = buffer.indexOf("\n\n")) !== -1) {
-        const frame = buffer.slice(0, index)
-        buffer = buffer.slice(index + 2)
-        const line = frame.split("\n").find((entry) => entry.startsWith("data: "))
-        if (!line) continue
-        try {
-          seen.push(JSON.parse(line.slice(6)))
-          for (const wake of waiters.splice(0)) wake()
-        } catch {
-          // ignore malformed frames
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let index: number
+        while ((index = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, index)
+          buffer = buffer.slice(index + 2)
+          const line = frame.split("\n").find((entry) => entry.startsWith("data: "))
+          if (!line) continue
+          try {
+            seen.push(JSON.parse(line.slice(6)))
+            for (const wake of waiters.splice(0)) wake()
+          } catch {
+            // ignore malformed frames
+          }
         }
       }
+    } catch {
+      // the stream is aborted once the assertion is satisfied
     }
   })()
 

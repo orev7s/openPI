@@ -15,6 +15,7 @@ let upstream: Upstream | undefined
 if (env.OPENPI_UPSTREAM) {
   upstream = {
     url: env.OPENPI_UPSTREAM,
+    password: env.OPENPI_UPSTREAM_PASSWORD ?? "",
     directory,
     stop: async () => {},
   }

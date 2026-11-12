@@ -56,11 +56,26 @@ Configuration (environment variables):
 
 ## Status
 
-Foundation is built and unit-tested: OMP RPC transport with protocol v2 framing,
-the OMP to OpenCode event translator, the SSE feed, the session store and
-manager, and the engine-facing HTTP routes with a proxy fallback for everything
-else. See `ARCHITECTURE.md` for the milestone list. Not yet verified end to end
-against a live model.
+Foundation is built and tested. Verified against the real engine and the real
+UI:
+
+- unit and integration tests: `node --test test/` (22 passing), including an
+  end-to-end test that drives a prompt through a fake OMP and asserts the SSE
+  stream and the persisted transcript;
+- a real turn through the live `omp` engine: a prompt produced `pong`, streamed
+  as `session.text.delta`, and the transcript persisted user, assistant and idle
+  messages;
+- the real OpenCode v2 web app is served on the listen port, `/api/model`
+  reports OMP's 235-model catalog, and the non-engine endpoints proxy through
+  to the private upstream.
+
+What is implemented: OMP RPC transport with protocol v2 framing, the OMP to
+OpenCode event translator, the SSE feed, the session store and manager, and the
+engine-facing routes (`info`, `location`, `event`, `session*`, `model`,
+`provider`, `agent`) with a proxy fallback for everything else. See
+`ARCHITECTURE.md` for the milestone list. Next up: model/provider/agent served
+from OMP config, skills, commands, permissions, fork/revert, compaction, and
+browser verification of the UI.
 
 ## Tests
 

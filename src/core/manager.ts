@@ -51,6 +51,7 @@ interface Runtime {
   unsubscribe?: () => void
   engineError?: string
   closing?: boolean
+  seq?: number
 }
 
 const emptyTokens = (): Tokens => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
@@ -230,12 +231,21 @@ export class Manager {
       sessionDir,
     })
     rt.omp = omp
+    let model = rt.info.model
+    if (!model) {
+      const state = await omp.send<{ model?: { provider?: string; id?: string } }>({ type: "get_state" }).catch(() => undefined)
+      const reported = state?.data?.model
+      if (reported?.provider && reported.id) {
+        model = { providerID: reported.provider, modelID: reported.id }
+        rt.info.model = model
+      }
+    }
     rt.translator = new EventTranslator({
       sessionID: rt.info.id,
       directory: rt.info.location.directory,
       projectID: rt.info.projectID,
       agent: rt.info.agent ?? "build",
-      model: rt.info.model ?? { providerID: "anthropic", modelID: "claude-sonnet-4-5" },
+      model: model ?? { providerID: "unknown", modelID: "unknown" },
     })
     rt.unsubscribe = omp.onEvent((event) => this.#onEngineEvent(rt, event))
     void omp.exited.then(({ code }) => {
@@ -315,8 +325,8 @@ export class Manager {
 }
 
 function nextSeq(rt: Runtime): number {
-  const value = (rt.info as unknown as { __seq?: number }).__seq ?? 0
-  ;(rt.info as unknown as { __seq?: number }).__seq = value + 1
+  const value = rt.seq ?? 0
+  rt.seq = value + 1
   return value
 }
 

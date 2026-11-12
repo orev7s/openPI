@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto"
 
 export interface Upstream {
   url: string
+  password: string
   directory: string
   stop(): Promise<void>
 }
@@ -49,6 +50,7 @@ export async function startUpstream(options: {
 
   return {
     url,
+    password,
     directory: options.directory,
     stop: () =>
       new Promise<void>((resolve) => {
