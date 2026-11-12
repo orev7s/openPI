@@ -1,0 +1,17 @@
+{
+  "name": "openpi",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode v2 UI backed by the Oh My Pi (OMP) agent engine.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "dev": "node --watch src/index.ts",
+    "test": "node --test test/",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT"
+}

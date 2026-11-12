@@ -1,0 +1,515 @@
+import { join } from "node:path"
+import { startOmp } from "../omp/client.ts"
+import { EventTranslator } from "../omp/map.ts"
+import type { OmpClient, OmpEvent, SessionEventEnvelope } from "../omp/types.ts"
+import { Feed } from "./feed.ts"
+import { eventID, messageID, sessionID } from "./ids.ts"
+import { Store } from "./store.ts"
+
+export interface ModelRef {
+  providerID: string
+  modelID: string
+}
+
+export interface Tokens {
+  input: number
+  output: number
+  reasoning: number
+  cache: { read: number; write: number }
+}
+
+export interface SessionInfo {
+  id: string
+  projectID: string
+  agent?: string
+  model?: ModelRef
+  cost: number
+  tokens: Tokens
+  time: { created: number; updated: number; idle?: number }
+  title?: string
+  location: { directory: string }
+  outcome?: "succeeded" | "failed" | "interrupted"
+}
+
+export interface ManagerOptions {
+  feed: Feed
+  store: Store
+  /** Root of the project sessions run against. */
+  directory: string
+  /** Where per-session OMP conversation dirs live. */
+  dataDir: string
+  /** OMP executable, default "omp". */
+  command?: string
+  args?: string[]
+}
+
+interface Runtime {
+  info: SessionInfo
+  messages: Record<string, unknown>[]
+  omp?: OmpClient
+  translator?: EventTranslator
+  unsubscribe?: () => void
+  engineError?: string
+  closing?: boolean
+}
+
+const emptyTokens = (): Tokens => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
+
+// Owns the mapping between one OpenCode session and one OMP RPC process.
+export class Manager {
+  #feed: Feed
+  #store: Store
+  #directory: string
+  #dataDir: string
+  #command: string
+  #args: string[]
+  #runtimes = new Map<string, Runtime>()
+  #catalog?: Promise<OmpClient>
+
+  constructor(options: ManagerOptions) {
+    this.#feed = options.feed
+    this.#store = options.store
+    this.#directory = options.directory
+    this.#dataDir = options.dataDir
+    this.#command = options.command ?? "omp"
+    this.#args = options.args ?? []
+  }
+
+  // ---- sessions -----------------------------------------------------------
+
+  createSession(input: { directory?: string; agent?: string; model?: ModelRef; title?: string } = {}): SessionInfo {
+    const now = Date.now()
+    const info: SessionInfo = {
+      id: sessionID(),
+      projectID: projectID(input.directory ?? this.#directory),
+      agent: input.agent ?? "build",
+      cost: 0,
+      tokens: emptyTokens(),
+      time: { created: now, updated: now },
+      location: { directory: input.directory ?? this.#directory },
+      ...(input.model ? { model: input.model } : {}),
+      ...(input.title ? { title: input.title } : {}),
+    }
+    const rt: Runtime = { info, messages: [] }
+    this.#runtimes.set(info.id, rt)
+    this.#store.save(info.id, { info, messages: [] })
+    this.#publish(rt, "session.created", {
+      sessionID: info.id,
+      projectID: info.projectID,
+      location: info.location,
+      slug: "",
+      version: "openpi",
+      ...(info.model ? { model: info.model } : {}),
+      ...(info.agent ? { agent: info.agent } : {}),
+      ...(info.title ? { title: info.title } : {}),
+    }, 1)
+    return info
+  }
+
+  listSessions(): SessionInfo[] {
+    return this.#store.list().map((row) => row.record.info as unknown as SessionInfo)
+  }
+
+  getSession(id: string): SessionInfo | undefined {
+    return this.#runtime(id)?.info
+  }
+
+  messages(id: string): Record<string, unknown>[] | undefined {
+    return this.#runtime(id)?.messages
+  }
+
+  renameSession(id: string, title: string): SessionInfo | undefined {
+    const rt = this.#runtime(id)
+    if (!rt) return undefined
+    rt.info.title = title
+    rt.info.time.updated = Date.now()
+    this.#persist(rt)
+    this.#publish(rt, "session.renamed", { sessionID: id, title }, 1)
+    return rt.info
+  }
+
+  async deleteSession(id: string): Promise<boolean> {
+    const rt = this.#runtime(id)
+    if (!rt) return false
+    await this.#stopEngine(rt)
+    this.#runtimes.delete(id)
+    this.#store.delete(id)
+    this.#publish(rt, "session.deleted", { sessionID: id }, 2)
+    return true
+  }
+
+  // ---- execution ----------------------------------------------------------
+
+  async prompt(
+    id: string,
+    body: { text: string; files?: unknown[]; agents?: unknown[]; skills?: unknown[]; delivery?: "steer" | "queue" },
+  ): Promise<Record<string, unknown> | undefined> {
+    const rt = this.#runtime(id)
+    if (!rt) return undefined
+    await this.#ensureEngine(rt)
+
+    const inboxID = messageID()
+    const created = Date.now()
+    const payload: Record<string, unknown> = {
+      text: body.text,
+      ...(body.files ? { files: body.files } : {}),
+      ...(body.agents ? { agents: body.agents } : {}),
+      ...(body.skills ? { skills: body.skills } : {}),
+    }
+    const delivery = body.delivery ?? "queue"
+    const item = { type: "user", payload, delivery }
+
+    rt.messages.push({
+      id: inboxID,
+      type: "user",
+      time: { created },
+      text: body.text,
+      files: body.files ?? [],
+      agents: body.agents ?? [],
+      skills: body.skills ?? [],
+    })
+    this.#publish(rt, "session.inbox.enqueued", { sessionID: id, inboxID, item }, 1)
+    this.#persist(rt)
+    this.#publish(rt, "session.inbox.delivered", { sessionID: id, inboxID }, 1)
+
+    const streamingBehavior = body.delivery === "steer" ? "steer" : "followUp"
+    void rt.omp!
+      .send({ type: "prompt", message: body.text, streamingBehavior })
+      .catch((error) => this.#engineFailure(rt, error))
+
+    return { id: inboxID, sessionID: id, time: { created }, type: "user", payload, delivery }
+  }
+
+  async interrupt(id: string): Promise<void> {
+    const rt = this.#runtime(id)
+    if (!rt?.omp) return
+    for (const envelope of rt.translator?.interrupted() ?? []) this.#emit(rt, envelope)
+    await rt.omp.send({ type: "abort" }).catch(() => undefined)
+  }
+
+  async setModel(id: string, ref: ModelRef): Promise<void> {
+    const rt = this.#runtime(id)
+    if (!rt) return
+    rt.info.model = ref
+    rt.info.time.updated = Date.now()
+    this.#persist(rt)
+    this.#publish(rt, "session.model.selected", { sessionID: id, model: ref }, 1)
+    if (rt.omp) await rt.omp.send({ type: "set_model", provider: ref.providerID, modelId: ref.modelID }).catch(() => undefined)
+  }
+
+  async close(): Promise<void> {
+    await Promise.all([...this.#runtimes.values()].map((rt) => this.#stopEngine(rt)))
+  }
+
+  // ---- catalog ------------------------------------------------------------
+
+  async models(): Promise<Record<string, unknown>[]> {
+    const client = await this.#catalogClient()
+    const response = await client.send<unknown>({ type: "get_available_models" })
+    const data = response.data
+    const list = Array.isArray(data) ? data : ((data as { models?: unknown[] } | undefined)?.models ?? [])
+    return (list as Record<string, unknown>[]).map((model) => toModelInfo(model))
+  }
+
+  async #catalogClient(): Promise<OmpClient> {
+    if (!this.#catalog) {
+      this.#catalog = startOmp({ command: this.#command, args: this.#args, cwd: this.#directory })
+    }
+    return this.#catalog
+  }
+
+  // ---- engine lifecycle ---------------------------------------------------
+
+  async #ensureEngine(rt: Runtime): Promise<void> {
+    if (rt.omp) return
+    const sessionDir = join(this.#dataDir, "omp", rt.info.id)
+    const omp = await startOmp({
+      command: this.#command,
+      args: this.#args,
+      cwd: rt.info.location.directory,
+      sessionDir,
+    })
+    rt.omp = omp
+    rt.translator = new EventTranslator({
+      sessionID: rt.info.id,
+      directory: rt.info.location.directory,
+      projectID: rt.info.projectID,
+      agent: rt.info.agent ?? "build",
+      model: rt.info.model ?? { providerID: "anthropic", modelID: "claude-sonnet-4-5" },
+    })
+    rt.unsubscribe = omp.onEvent((event) => this.#onEngineEvent(rt, event))
+    void omp.exited.then(({ code }) => {
+      if (!rt.closing) this.#engineFailure(rt, new Error(`omp exited (${code})`))
+    })
+    if (rt.info.model) {
+      await omp
+        .send({ type: "set_model", provider: rt.info.model.providerID, modelId: rt.info.model.modelID })
+        .catch(() => undefined)
+    }
+  }
+
+  async #stopEngine(rt: Runtime): Promise<void> {
+    rt.closing = true
+    rt.unsubscribe?.()
+    rt.unsubscribe = undefined
+    const omp = rt.omp
+    rt.omp = undefined
+    if (omp) await omp.close().catch(() => undefined)
+  }
+
+  #onEngineEvent(rt: Runtime, event: OmpEvent): void {
+    if (!rt.translator) return
+    const envelopes = rt.translator.translate(event)
+    for (const envelope of envelopes) this.#emit(rt, envelope)
+  }
+
+  #engineFailure(rt: Runtime, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    if (rt.engineError === message) return
+    rt.engineError = message
+    rt.info.outcome = "failed"
+    rt.info.time.idle = Date.now()
+    this.#emit(rt, {
+      id: eventID(),
+      created: Date.now(),
+      type: "session.execution.failed",
+      location: rt.info.location,
+      data: { sessionID: rt.info.id, error: { type: "unknown", message } },
+      durable: { aggregateID: rt.info.id, seq: nextSeq(rt), version: 1 },
+    })
+  }
+
+  // ---- projection + publication ------------------------------------------
+
+  #emit(rt: Runtime, envelope: SessionEventEnvelope): void {
+    projectIntoMessages(rt, envelope)
+    this.#feed.publish(envelope)
+    if (envelope.durable) this.#persist(rt)
+  }
+
+  #publish(rt: Runtime, type: string, data: Record<string, unknown>, version: number): void {
+    this.#emit(rt, {
+      id: eventID(),
+      created: Date.now(),
+      type,
+      location: rt.info.location,
+      data,
+      durable: { aggregateID: rt.info.id, seq: nextSeq(rt), version },
+    })
+  }
+
+  #persist(rt: Runtime): void {
+    rt.info.time.updated = Date.now()
+    this.#store.save(rt.info.id, { info: rt.info, messages: rt.messages })
+  }
+
+  #runtime(id: string): Runtime | undefined {
+    const existing = this.#runtimes.get(id)
+    if (existing) return existing
+    const record = this.#store.load(id)
+    if (!record) return undefined
+    const rt: Runtime = { info: record.info as unknown as SessionInfo, messages: record.messages }
+    this.#runtimes.set(id, rt)
+    return rt
+  }
+}
+
+function nextSeq(rt: Runtime): number {
+  const value = (rt.info as unknown as { __seq?: number }).__seq ?? 0
+  ;(rt.info as unknown as { __seq?: number }).__seq = value + 1
+  return value
+}
+
+export function projectID(directory: string): string {
+  return createHashHex(directory)
+}
+
+function createHashHex(value: string): string {
+  // Stable 40-char id, matching the shape opencode uses for project ids.
+  let h1 = 0x811c9dc5
+  let out = ""
+  for (let i = 0; i < value.length; i++) {
+    h1 = Math.imul(h1 ^ value.charCodeAt(i), 0x01000193)
+    out += (h1 >>> 0).toString(16).padStart(8, "0")
+    if (out.length >= 40) break
+  }
+  return out.slice(0, 40).padEnd(40, "0")
+}
+
+// ---- message projection ---------------------------------------------------
+
+function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void {
+  const data = envelope.data as Record<string, any>
+  const messages = rt.messages
+  const findAssistant = () =>
+    messages.find((m) => m.id === data.assistantMessageID && m.type === "assistant") as
+      | { content: any[]; [k: string]: unknown }
+      | undefined
+
+  switch (envelope.type) {
+    case "session.step.started":
+      messages.push({
+        id: data.assistantMessageID,
+        type: "assistant",
+        time: { created: envelope.created },
+        agent: data.agent,
+        model: data.model,
+        content: [],
+      })
+      break
+    case "session.text.started": {
+      findAssistant()?.content.push({ type: "text", text: "" })
+      break
+    }
+    case "session.text.delta": {
+      const content = findAssistant()?.content
+      const last = content?.[content.length - 1]
+      if (last && last.type === "text") last.text += data.delta
+      break
+    }
+    case "session.text.ended": {
+      const content = findAssistant()?.content
+      const last = content?.[content.length - 1]
+      if (last && last.type === "text") last.text = data.text
+      break
+    }
+    case "session.reasoning.started":
+      findAssistant()?.content.push({ type: "reasoning", text: "", time: { created: envelope.created } })
+      break
+    case "session.reasoning.delta": {
+      const content = findAssistant()?.content
+      const last = content?.[content.length - 1]
+      if (last && last.type === "reasoning") last.text += data.delta
+      break
+    }
+    case "session.reasoning.ended": {
+      const content = findAssistant()?.content
+      const last = content?.[content.length - 1]
+      if (last && last.type === "reasoning") {
+        last.text = data.text
+        last.time = { ...last.time, completed: envelope.created }
+      }
+      break
+    }
+    case "session.tool.input.started":
+      findAssistant()?.content.push({
+        type: "tool",
+        id: data.id,
+        name: data.name,
+        state: { status: "streaming", input: "" },
+        time: { created: envelope.created },
+      })
+      break
+    case "session.tool.input.delta": {
+      const tool = findTool(findAssistant(), data.id)
+      if (tool && tool.state.status === "streaming") tool.state.input += data.delta
+      break
+    }
+    case "session.tool.input.ended": {
+      const tool = findTool(findAssistant(), data.id)
+      if (tool && tool.state.status === "streaming") tool.state.input = data.text
+      break
+    }
+    case "session.tool.called": {
+      const tool = findTool(findAssistant(), data.id)
+      if (tool) tool.state = { status: "running", input: data.input, metadata: {} }
+      break
+    }
+    case "session.tool.progress": {
+      const tool = findTool(findAssistant(), data.id)
+      if (tool && tool.state.status === "running") tool.state.metadata = data.metadata
+      break
+    }
+    case "session.tool.success": {
+      const tool = findTool(findAssistant(), data.id)
+      if (tool)
+        tool.state = {
+          status: "completed",
+          input: tool.state.input ?? {},
+          content: data.content,
+          metadata: data.metadata,
+        }
+      break
+    }
+    case "session.tool.failed": {
+      const tool = findTool(findAssistant(), data.id)
+      if (tool)
+        tool.state = {
+          status: "error",
+          input: tool.state.input ?? {},
+          error: data.error,
+          content: data.content,
+        }
+      break
+    }
+    case "session.step.ended": {
+      const assistant = findAssistant()
+      if (assistant) {
+        assistant.finish = data.finish
+        assistant.cost = data.cost
+        assistant.tokens = data.tokens
+        assistant.time = { created: assistant.time?.created ?? envelope.created, completed: envelope.created }
+      }
+      break
+    }
+    case "session.execution.succeeded":
+    case "session.execution.failed":
+    case "session.execution.interrupted": {
+      const outcome =
+        envelope.type === "session.execution.succeeded"
+          ? "succeeded"
+          : envelope.type === "session.execution.failed"
+            ? "failed"
+            : "interrupted"
+      rt.info.outcome = outcome
+      rt.info.time.idle = envelope.created
+      messages.push({
+        id: messageID(),
+        type: "idle",
+        time: { created: envelope.created },
+        outcome,
+        ...(data.error ? { error: data.error } : {}),
+      })
+      break
+    }
+    default:
+      break
+  }
+}
+
+function findTool(assistant: { content: any[] } | undefined, id: unknown): any {
+  return assistant?.content.find((item) => item.type === "tool" && item.id === id)
+}
+
+// ---- model mapping --------------------------------------------------------
+
+function toModelInfo(model: Record<string, any>): Record<string, unknown> {
+  const input: string[] = Array.isArray(model.input) ? model.input : ["text"]
+  const cost = model.cost ?? {}
+  return {
+    id: model.id,
+    modelID: model.id,
+    providerID: model.provider,
+    type: "chat",
+    ...(model.identity?.family ? { family: model.identity.family } : {}),
+    name: model.name ?? model.id,
+    package: model.api ?? "omp",
+    settings: {},
+    headers: {},
+    capabilities: { tools: true, input, output: ["text"], temperature: false },
+    variants: [],
+    time: { released: 0 },
+    cost: [
+      {
+        input: cost.input ?? 0,
+        output: cost.output ?? 0,
+        cache: { read: cost.cacheRead ?? 0, write: cost.cacheWrite ?? 0 },
+      },
+    ],
+    status: "active",
+    enabled: true,
+    limit: { context: model.contextWindow ?? 0, output: model.maxTokens ?? 0 },
+  }
+}
+
+export { toModelInfo }
