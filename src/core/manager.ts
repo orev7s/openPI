@@ -57,6 +57,7 @@ interface Runtime {
   closing?: boolean
   seq?: number
   children?: Map<string, Runtime>
+  linkedTools?: Set<string>
 }
 
 const emptyTokens = (): Tokens => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
@@ -326,6 +327,8 @@ export class Manager {
   #onSubagentFrame(rt: Runtime, frame: OmpEvent): void {
     const payload = frame.payload as Record<string, unknown> | undefined
     if (!payload) return
+    const subagentID = String(payload.id ?? "")
+    this.#linkSubagentTool(rt, payload, subagentID)
 
     if (frame.type === "subagent_progress") {
       this.#childRuntime(rt, String(payload.id ?? ""), payload)
@@ -376,6 +379,21 @@ export class Manager {
             : { sessionID: child.id },
       durable: { aggregateID: child.id, seq: nextSeq(child), version: 1 },
     })
+  }
+
+  #linkSubagentTool(parent: Runtime, payload: Record<string, unknown>, subagentID: string): void {
+    const toolCallId = payload.parentToolCallId
+    if (typeof toolCallId !== "string" || !subagentID) return
+    parent.linkedTools ??= new Set()
+    if (parent.linkedTools.has(toolCallId)) return
+    parent.linkedTools.add(toolCallId)
+    const envelopes =
+      parent.translator?.linkSubagentTool(toolCallId, {
+        sessionID: subagentID,
+        background: payload.detached === true,
+      }) ?? []
+    for (const envelope of envelopes) this.#emit(parent, envelope)
+    if (envelopes.length > 0) this.#persist(parent)
   }
 
   #childRuntime(parent: Runtime, id: string, payload: Record<string, unknown>): Runtime | undefined {
@@ -580,7 +598,7 @@ function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void 
     }
     case "session.tool.progress": {
       const tool = findTool(findAssistant(), data.id)
-      if (tool && tool.state.status === "running") tool.state.metadata = data.metadata
+      if (tool && tool.state.status === "running") tool.state.metadata = { ...(tool.state.metadata ?? {}), ...(data.metadata ?? {}) }
       break
     }
     case "session.tool.success": {
@@ -590,7 +608,7 @@ function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void 
           status: "completed",
           input: tool.state.input ?? {},
           content: data.content,
-          metadata: data.metadata,
+          metadata: { ...(tool.state.metadata ?? {}), ...(data.metadata ?? {}) },
         }
       break
     }
@@ -602,6 +620,7 @@ function projectIntoMessages(rt: Runtime, envelope: SessionEventEnvelope): void 
           input: tool.state.input ?? {},
           error: data.error,
           content: data.content,
+          metadata: { ...(tool.state.metadata ?? {}) },
         }
       break
     }

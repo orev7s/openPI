@@ -34,6 +34,62 @@ function assistant(): Record<string, unknown> {
   }
 }
 
+test("renames OMP tools to the names the OpenCode UI renders and links subagents", () => {
+  const translator = new EventTranslator(opts)
+  const out: SessionEventEnvelope[] = []
+  const feed = (event: OmpEvent) => {
+    const emitted = translator.translate(event)
+    out.push(...emitted)
+    return emitted
+  }
+
+  const bashCall = { type: "toolCall", id: "call_bash", name: "bash", arguments: { command: "echo hi" } }
+  const taskCall = {
+    type: "toolCall",
+    id: "call_task",
+    name: "task",
+    arguments: { agent: "task", description: "child work", prompt: "go" },
+  }
+  const message = { role: "assistant", content: [bashCall, taskCall], timestamp: 1794505530000 }
+
+  feed({ type: "agent_start" })
+  feed({ type: "message_start", message })
+  feed({
+    type: "message_update",
+    message,
+    assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: message },
+  })
+  feed({
+    type: "message_update",
+    message,
+    assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: bashCall, partial: message },
+  })
+  feed({ type: "tool_execution_start", toolCallId: "call_bash", toolName: "bash", args: { command: "echo hi" } })
+
+  feed({
+    type: "message_update",
+    message,
+    assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, partial: message },
+  })
+  feed({ type: "tool_execution_start", toolCallId: "call_task", toolName: "task", args: taskCall.arguments })
+
+  const started = out.filter((event) => event.type === "session.tool.input.started")
+  assert.equal(started.find((event) => event.data.id === "call_bash")?.data.name, "shell")
+  assert.equal(started.find((event) => event.data.id === "call_task")?.data.name, "subagent")
+
+  const called = out.filter((event) => event.type === "session.tool.called")
+  assert.equal(called.find((event) => event.data.id === "call_bash")?.data.name, "shell")
+  assert.equal(called.find((event) => event.data.id === "call_task")?.data.name, "subagent")
+
+  const [link] = translator.linkSubagentTool("call_task", { sessionID: "FitPanther", background: true })
+  assert.equal(link.type, "session.tool.progress")
+  assert.equal(link.data.sessionID, "ses_test")
+  assert.equal(link.data.id, "call_task")
+  assert.equal(link.data.assistantMessageID, translator.assistantMessageID())
+  assert.deepEqual(link.data.metadata, { sessionID: "FitPanther", background: true })
+  assert.equal(link.durable, undefined, "progress is ephemeral")
+})
+
 test("maps a full OMP turn to ordered OpenCode envelopes", () => {
   const translator = new EventTranslator(opts)
   const out: SessionEventEnvelope[] = []

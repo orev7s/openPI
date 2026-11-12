@@ -71,6 +71,13 @@ function textOf(result: unknown): string {
     .join("\n")
 }
 
+// OMP tool names differ from the ones the OpenCode UI renders specially.
+const TOOL_NAME_MAP: Record<string, string> = { bash: "shell", task: "subagent" }
+
+function normalizeToolName(name: string): string {
+  return TOOL_NAME_MAP[name] ?? name
+}
+
 interface ToolCallRef {
   id: string
   name: string
@@ -90,6 +97,7 @@ export class EventTranslator {
   private readonly reasoningOrdByIndex = new Map<number, number>()
   private readonly toolCalls = new Map<string, { name: string; input: string; args: unknown }>()
   private readonly indexToCallID = new Map<number, string>()
+  private readonly toolAssistant = new Map<string, string>()
 
   constructor(opts: TranslatorOptions) {
     this.sessionID = opts.sessionID
@@ -139,6 +147,19 @@ export class EventTranslator {
   /** Emitted when the caller issues an abort. */
   interrupted(): SessionEventEnvelope[] {
     return [this.durable("session.execution.interrupted", { reason: "user" })]
+  }
+
+  /** Links a running subagent tool call to its child session for the UI. */
+  linkSubagentTool(toolCallId: string, info: { sessionID: string; background?: boolean }): SessionEventEnvelope[] {
+    const assistantID = this.toolAssistant.get(toolCallId) ?? this.assistantID
+    if (!assistantID) return []
+    return [
+      this.ephemeral("session.tool.progress", {
+        assistantMessageID: assistantID,
+        id: toolCallId,
+        metadata: { sessionID: info.sessionID, ...(info.background ? { background: true } : {}) },
+      }),
+    ]
   }
 
   private durable(type: string, data: Record<string, unknown>): SessionEventEnvelope {
@@ -240,12 +261,13 @@ export class EventTranslator {
         const call = this.pickToolCall(ame, index)
         if (!call) return []
         this.indexToCallID.set(index, call.id)
+        this.toolAssistant.set(call.id, assistantID)
         this.toolCalls.set(call.id, { name: call.name, input: "", args: call.arguments })
         return [
           this.durable("session.tool.input.started", {
             assistantMessageID: assistantID,
             id: call.id,
-            name: call.name,
+            name: normalizeToolName(call.name),
           }),
         ]
       }
@@ -308,8 +330,9 @@ export class EventTranslator {
     const assistantID = this.assistantID
     const id = event.toolCallId
     if (!assistantID || typeof id !== "string") return []
-    const name = typeof event.toolName === "string" ? event.toolName : ""
+    const name = normalizeToolName(typeof event.toolName === "string" ? event.toolName : "")
     const input = asRecord(event.args)
+    this.toolAssistant.set(id, assistantID)
     this.toolCalls.set(id, { name, input: "", args: input })
     return [
       this.durable("session.tool.called", {
