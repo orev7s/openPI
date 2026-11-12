@@ -41,6 +41,10 @@ export function createApp(options: AppOptions): App {
   const version = options.version ?? "openpi/0.0.1"
 
   const server = createServer((req, res) => {
+    if (process.env.OPENPI_DEBUG) {
+      const started = Date.now()
+      res.on("finish", () => console.log(`[http] ${req.method} ${req.url} ${res.statusCode} ${Date.now() - started}ms`))
+    }
     void dispatch({
       req,
       res,
@@ -93,7 +97,7 @@ async function dispatch(options: DispatchOptions): Promise<void> {
     return
   }
 
-  if (options.password && !authorized(req.headers.authorization, options.password)) {
+  if (options.password && !authorized(req, url, options.password)) {
     sendError(res, 401, "UnauthorizedError", "Authentication required")
     return
   }
@@ -108,10 +112,22 @@ function upstreamPassword(options: DispatchOptions): string | undefined {
   return options.upstreamPassword ?? options.upstream?.password
 }
 
-function authorized(header: string | undefined, password: string): boolean {
-  if (!header?.startsWith("Basic ")) return false
-  const decoded = Buffer.from(header.slice(6), "base64").toString("utf8")
+// Mirrors the upstream: Basic auth header, or an `auth_token` query parameter
+// holding the base64 of "username:password" (EventSource cannot set headers).
+function authorized(req: import("node:http").IncomingMessage, url: URL, password: string): boolean {
+  const token = url.searchParams.get("auth_token")
+  if (token) return matches(decodeCredential(token), password)
+  const header = req.headers.authorization
+  if (header?.startsWith("Basic ")) return matches(decodeCredential(header.slice(6)), password)
+  return false
+}
+
+function decodeCredential(input: string): string {
+  const decoded = Buffer.from(input, "base64").toString("utf8")
   const separator = decoded.indexOf(":")
-  const provided = separator === -1 ? decoded : decoded.slice(separator + 1)
+  return separator === -1 ? "" : decoded.slice(separator + 1)
+}
+
+function matches(provided: string, password: string): boolean {
   return provided === password
 }

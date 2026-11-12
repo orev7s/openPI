@@ -8,7 +8,8 @@ import { Store } from "./store.ts"
 
 export interface ModelRef {
   providerID: string
-  modelID: string
+  id: string
+  variant?: string
 }
 
 export interface Tokens {
@@ -78,16 +79,17 @@ export class Manager {
 
   // ---- sessions -----------------------------------------------------------
 
-  createSession(input: { directory?: string; agent?: string; model?: ModelRef; title?: string } = {}): SessionInfo {
+  createSession(input: { directory?: string; location?: { directory?: string }; agent?: string; model?: ModelRef; title?: string } = {}): SessionInfo {
     const now = Date.now()
+    const directory = input.directory ?? input.location?.directory ?? this.#directory
     const info: SessionInfo = {
       id: sessionID(),
-      projectID: projectID(input.directory ?? this.#directory),
+      projectID: projectID(directory),
       agent: input.agent ?? "build",
       cost: 0,
       tokens: emptyTokens(),
       time: { created: now, updated: now },
-      location: { directory: input.directory ?? this.#directory },
+      location: { directory },
       ...(input.model ? { model: input.model } : {}),
       ...(input.title ? { title: input.title } : {}),
     }
@@ -176,6 +178,9 @@ export class Manager {
     const streamingBehavior = body.delivery === "steer" ? "steer" : "followUp"
     void rt.omp!
       .send({ type: "prompt", message: body.text, streamingBehavior })
+      .then((response) => {
+        if (!response.success) this.#engineFailure(rt, new Error(response.error ?? "prompt rejected"))
+      })
       .catch((error) => this.#engineFailure(rt, error))
 
     return { id: inboxID, sessionID: id, time: { created }, type: "user", payload, delivery }
@@ -195,7 +200,7 @@ export class Manager {
     rt.info.time.updated = Date.now()
     this.#persist(rt)
     this.#publish(rt, "session.model.selected", { sessionID: id, model: ref }, 1)
-    if (rt.omp) await rt.omp.send({ type: "set_model", provider: ref.providerID, modelId: ref.modelID }).catch(() => undefined)
+    if (rt.omp) await rt.omp.send({ type: "set_model", provider: ref.providerID, modelId: ref.id }).catch(() => undefined)
   }
 
   async close(): Promise<void> {
@@ -236,7 +241,7 @@ export class Manager {
       const state = await omp.send<{ model?: { provider?: string; id?: string } }>({ type: "get_state" }).catch(() => undefined)
       const reported = state?.data?.model
       if (reported?.provider && reported.id) {
-        model = { providerID: reported.provider, modelID: reported.id }
+        model = { providerID: reported.provider, id: reported.id }
         rt.info.model = model
       }
     }
@@ -245,7 +250,7 @@ export class Manager {
       directory: rt.info.location.directory,
       projectID: rt.info.projectID,
       agent: rt.info.agent ?? "build",
-      model: model ?? { providerID: "unknown", modelID: "unknown" },
+      model: model ?? { providerID: "unknown", id: "unknown" },
     })
     rt.unsubscribe = omp.onEvent((event) => this.#onEngineEvent(rt, event))
     void omp.exited.then(({ code }) => {
@@ -253,7 +258,7 @@ export class Manager {
     })
     if (rt.info.model) {
       await omp
-        .send({ type: "set_model", provider: rt.info.model.providerID, modelId: rt.info.model.modelID })
+        .send({ type: "set_model", provider: rt.info.model.providerID, modelId: rt.info.model.id })
         .catch(() => undefined)
     }
   }
@@ -270,6 +275,7 @@ export class Manager {
   #onEngineEvent(rt: Runtime, event: OmpEvent): void {
     if (!rt.translator) return
     const envelopes = rt.translator.translate(event)
+    if (process.env.OPENPI_DEBUG) console.log(`[omp] ${event.type} -> ${envelopes.length} event(s)`)
     for (const envelope of envelopes) this.#emit(rt, envelope)
   }
 

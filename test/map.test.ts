@@ -8,7 +8,7 @@ const opts = {
   directory: "/tmp/openpi",
   projectID: "proj_test",
   agent: "build",
-  model: { providerID: "rotator-tokenharbor", modelID: "deepseek-v4.1-flash:free" },
+  model: { providerID: "rotator-tokenharbor", id: "deepseek-v4.1-flash:free" },
 }
 
 const toolCall = { type: "toolCall", id: "call_1", name: "read", arguments: { filePath: "/tmp/x" } }

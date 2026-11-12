@@ -47,7 +47,7 @@ async function handle(frame) {
       return
     case "get_state":
       respond({
-        model: { providerID: "anthropic", modelID: "claude-fake" },
+        model: { providerID: "anthropic", id: "claude-fake" },
         isStreaming: false,
         messageCount: 0,
         protocolVersion: negotiatedVersion,
@@ -57,7 +57,7 @@ async function handle(frame) {
       respond({ ok: true })
       return
     case "get_available_models":
-      respond({ models: [{ providerID: "anthropic", modelID: "claude-fake", name: "Claude Fake" }] })
+      respond({ models: [{ providerID: "anthropic", id: "claude-fake", name: "Claude Fake" }] })
       return
     case "new_session":
     case "open_session":

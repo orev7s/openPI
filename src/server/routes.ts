@@ -15,8 +15,6 @@ export interface RouteContext {
   version: string
 }
 
-const now = () => Date.now()
-
 // Handles every route openPI owns. Returns false when the request belongs to
 // the upstream (static UI or a peripheral API).
 export async function handleOwned(ctx: RouteContext): Promise<boolean> {
@@ -70,8 +68,23 @@ export async function handleOwned(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
+  // Worktrees are project-scoped and owned here so the UI never hits the
+  // upstream's project database. openPI keeps no worktrees.
+  if (path === "/api/worktree" && method === "GET") {
+    sendJson(res, 200, [])
+    return true
+  }
+  if (path === "/api/worktree" && (method === "POST" || method === "DELETE")) {
+    res.writeHead(204).end()
+    return true
+  }
+  if (path === "/api/worktree/refresh" && method === "POST") {
+    res.writeHead(204).end()
+    return true
+  }
+
   if (path === "/api/session" && method === "GET") {
-    sendJson(res, 200, { data: ctx.manager.listSessions(), cursor: {} })
+    sendJson(res, 200, { data: listSessions(ctx), cursor: {} })
     return true
   }
 
@@ -81,80 +94,122 @@ export async function handleOwned(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
-  const rest = sessionRoute(path)
-  if (rest) return await handleSession(ctx, method, rest)
+  // Any /api/session/<id>/... is owned here: the session lives in openPI, so
+  // the upstream cannot answer for it.
+  if (path.startsWith("/api/session/")) {
+    await handleSession(ctx, method)
+    return true
+  }
 
   return false
 }
 
-type SessionRoute = { id: string; action?: string }
-
-function sessionRoute(path: string): SessionRoute | undefined {
-  const match = path.match(/^\/api\/session\/([^/]+)(?:\/([^/]+))?$/)
-  if (!match) return undefined
-  return { id: match[1], action: match[2] }
+function listSessions(ctx: RouteContext): unknown[] {
+  const parentID = ctx.url.searchParams.get("parentID")
+  const order = ctx.url.searchParams.get("order") ?? "desc"
+  const limit = Number(ctx.url.searchParams.get("limit") ?? "0")
+  let sessions = ctx.manager.listSessions() as Record<string, unknown>[]
+  if (parentID !== null) {
+    // openPI never creates child sessions, so a parent filter matches nothing.
+    sessions = parentID === "null" ? sessions : []
+  }
+  if (order === "asc") sessions = [...sessions].reverse()
+  if (Number.isFinite(limit) && limit > 0) sessions = sessions.slice(0, limit)
+  return sessions
 }
 
-async function handleSession(ctx: RouteContext, method: string, route: SessionRoute): Promise<boolean> {
-  const { req, res, manager } = ctx
-  const info = manager.getSession(route.id)
-  if (!info) {
-    sendError(res, 404, "SessionNotFoundError", `Session not found: ${route.id}`)
-    return true
+async function handleSession(ctx: RouteContext, method: string): Promise<void> {
+  const { req, res, manager, url } = ctx
+  const rest = url.pathname.slice("/api/session/".length)
+  const slash = rest.indexOf("/")
+  const id = slash === -1 ? rest : rest.slice(0, slash)
+  const action = slash === -1 ? undefined : rest.slice(slash + 1)
+
+  if (!manager.getSession(id)) {
+    sendError(res, 404, "SessionNotFoundError", `Session not found: ${id}`)
+    return
   }
 
-  if (!route.action && method === "GET") {
-    sendJson(res, 200, { data: info })
-    return true
-  }
-  if (!route.action && method === "PATCH") {
-    const body = await readJson(req)
-    const updated = typeof body.title === "string" ? manager.renameSession(route.id, body.title) : info
-    sendJson(res, 200, { data: updated })
-    return true
-  }
-  if (!route.action && method === "DELETE") {
-    await manager.deleteSession(route.id)
-    res.writeHead(204).end()
-    return true
+  if (action === undefined) {
+    if (method === "GET") {
+      sendJson(res, 200, { data: manager.getSession(id) })
+      return
+    }
+    if (method === "PATCH") {
+      const body = await readJson(req)
+      if (typeof body.title === "string") manager.renameSession(id, body.title)
+      res.writeHead(204).end()
+      return
+    }
+    if (method === "DELETE") {
+      await manager.deleteSession(id)
+      res.writeHead(204).end()
+      return
+    }
   }
 
-  switch (route.action) {
+  switch (action) {
     case "prompt": {
       const body = await readJson(req)
-      const data = await manager.prompt(route.id, body as never)
-      if (!data) {
-        sendError(res, 404, "SessionNotFoundError", `Session not found: ${route.id}`)
-        return true
-      }
+      const data = await manager.prompt(id, body as never)
       sendJson(res, 200, { data })
-      return true
+      return
     }
     case "message": {
-      sendJson(res, 200, { data: manager.messages(route.id) ?? [], cursor: {} })
-      return true
+      sendJson(res, 200, { data: orderedMessages(ctx, id), cursor: {} })
+      return
+    }
+    case "context": {
+      sendJson(res, 200, { data: manager.messages(id) ?? [] })
+      return
     }
     case "interrupt": {
-      await manager.interrupt(route.id)
+      await manager.interrupt(id)
       res.writeHead(204).end()
-      return true
+      return
     }
     case "model": {
       const body = await readJson(req)
-      const providerID = body.providerID ?? body.provider
-      const modelID = body.modelID ?? body.model
-      if (typeof providerID === "string" && typeof modelID === "string") {
-        await manager.setModel(route.id, { providerID, modelID })
+      const ref = body.model as { id?: unknown; providerID?: unknown; variant?: unknown } | undefined
+      if (ref && typeof ref.id === "string" && typeof ref.providerID === "string") {
+        await manager.setModel(id, {
+          id: ref.id,
+          providerID: ref.providerID,
+          ...(typeof ref.variant === "string" ? { variant: ref.variant } : {}),
+        })
       }
       res.writeHead(204).end()
-      return true
+      return
     }
-    case "agent":
+    case "view":
       res.writeHead(204).end()
-      return true
+      return
+    case "revert":
+      res.writeHead(204).end()
+      return
+    case "inbox":
+    case "permission":
+    case "form":
+    case "diff":
+    case "log":
+      sendJson(res, 200, { data: [] })
+      return
     default:
-      return false
+      // Unknown session sub-resource: answer with a shape the UI can consume
+      // instead of letting the upstream's 404 crash the app.
+      if (method === "GET") sendJson(res, 200, { data: [] })
+      else res.writeHead(204).end()
+      return
   }
+}
+
+function orderedMessages(ctx: RouteContext, id: string): unknown[] {
+  let messages = ctx.manager.messages(id) ?? []
+  const order = ctx.url.searchParams.get("order") ?? "asc"
+  const limit = Number(ctx.url.searchParams.get("limit") ?? "0")
+  if (order === "desc") messages = [...messages].reverse()
+  if (Number.isFinite(limit) && limit > 0) messages = messages.slice(0, limit)
+  return messages
 }
 
 async function streamEvents(ctx: RouteContext): Promise<void> {
@@ -225,6 +280,3 @@ const AGENTS = [
     ],
   },
 ]
-
-// Keep a stable reference so the UI's session list ordering matches storage.
-void now

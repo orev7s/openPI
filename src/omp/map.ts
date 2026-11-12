@@ -9,7 +9,7 @@ export interface TranslatorOptions {
   directory: string
   projectID: string
   agent: string
-  model: { providerID: string; modelID: string }
+  model: { providerID: string; id: string; variant?: string }
 }
 
 // Monotonic-ish base36 suffix: wall clock plus a counter so IDs created in the
@@ -81,7 +81,7 @@ export class EventTranslator {
   private readonly sessionID: string
   private readonly directory: string
   private readonly agent: string
-  private readonly model: { providerID: string; modelID: string }
+  private readonly model: { providerID: string; id: string; variant?: string }
   private seqCounter = 0
   private assistantID: string | undefined
   private textOrdinal = 0
@@ -107,7 +107,7 @@ export class EventTranslator {
     return this.assistantID
   }
 
-  currentModel(): { providerID: string; modelID: string } {
+  currentModel(): { providerID: string; id: string; variant?: string } {
     return this.model
   }
 
