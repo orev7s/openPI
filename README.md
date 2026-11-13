@@ -27,9 +27,10 @@ ask, the same way OpenCode names them.
 
 - Node 24 or newer (the code uses `node:sqlite` and runs TypeScript directly).
 - `omp` on your `PATH`. This is the engine that does the work.
-- `opencode` on your `PATH`. openPI uses its built web app and its non-agent
-  endpoints (filesystem, git, terminals, MCP). It never routes agent work
-  through it.
+- Bun, to run the vendored OpenCode fork in `opencode/`. openPI serves that
+  fork's web app and its non-agent endpoints (filesystem, git, terminals, MCP).
+  It never routes agent work through it. If the fork is not built, openPI falls
+  back to an `opencode` binary on your `PATH`.
 
 ## Quick start
 
@@ -37,6 +38,10 @@ ask, the same way OpenCode names them.
 # clone
 git clone https://github.com/orev7s/openPI.git
 cd openPI
+
+# build the vendored OpenCode fork (the web app openPI serves)
+bun run ui:install
+bun run ui:build
 
 # auth for the web UI. If unset, openPI runs with auth disabled.
 export OPENPI_PASSWORD=choose-something
@@ -72,7 +77,7 @@ All configuration is environment variables.
 browser / mobile client
       |  HTTP + SSE + Basic auth
 openPI server (Node)
-      |-- serves the OpenCode web app          proxied to a private `opencode serve`
+      |-- serves the OpenCode web app          the vendored fork in `opencode/`
       |-- owns the agent-facing API            GET /api/event (SSE),
       |                                        /api/session*, /api/model, ...
       |-- proxies everything else              fs, git, pty, shell, mcp, ...
@@ -81,8 +86,10 @@ openPI server (Node)
 omp --mode rpc --session-dir <per-session dir>
 ```
 
-openPI starts a private `opencode serve` for two narrow jobs: serving the built
+openPI starts a private OpenCode server for two narrow jobs: serving the built
 web app, and answering the endpoints that are not part of the agent engine.
+It prefers the vendored fork in `opencode/`, so the UI is ours to change, and it
+falls back to an `opencode` binary on your `PATH` when that fork is not built.
 Every agent turn runs in its own `omp` process.
 
 The interesting part is the translation layer. OMP speaks its own event
@@ -96,28 +103,34 @@ section.
 
 ## Tool names and the UI
 
-The OpenCode UI renders tools by name. It has a special card for `shell`,
-`execute`, `read`, `edit`, `write`, `grep`, `glob`, `subagent` and a few others.
-Any other name falls back to a generic card that shows the tool name and its
-input but hides the output.
+The web UI renders tools by name through a registry: each name maps to a card
+component. The vendored fork in `opencode/` extends that registry with the tools
+OMP ships, so they render as their own cards instead of a generic blob:
 
-OMP names some of the same tools differently, so openPI renames them on the way
-through:
+- `todo` shows the checklist it wrote, with per-item status.
+- `wait`, `find`, `lsp`, `ast_grep`, `ast_edit`, `github`, `checkpoint`,
+  `rewind`, `context_notes`, `new_context`, `security_scan`, `debug`, `ida`,
+  the memory tools, `manage_skill`, `browser`, `computer`, `image_gen`, `ask`
+  and `report_tool_issue` each get a titled card with their arguments and their
+  result.
+- Anything still unknown falls back to the generic card, which now shows the
+  tool's output instead of hiding it.
 
-| OMP tool | Shown as |
-| --- | --- |
-| `bash` | `shell` |
-| `task` | `subagent` |
-| `eval` | `execute` |
-| `web_search` | `websearch` |
+The fork also understands OMP's raw names for tools that already have a card,
+so `bash` renders as the shell card, `task` as the subagent card, `eval` as the
+execute card and `web_search` as the web search card even before openPI's rename.
 
-For a tool the UI has never heard of (including one your agent just created),
-openPI picks the closest renderer from the shape of the tool's input. A tool
-that takes a `command` renders as a shell card, one that takes `code` renders as
-an execute card, `url` becomes a fetch, `query` becomes a search, and a `path`
-becomes a read, write or edit depending on the rest of the arguments. If nothing
-matches, it stays generic. Either way the call, its input and its result end up
-in the transcript.
+openPI still renames those four on the way through, and it forwards every other
+known OMP tool unchanged. It only guesses a renderer from the input shape for a
+tool it has never seen, so a custom tool your agent just created still lands in
+the transcript rather than being dropped. A tool that takes a `command` renders
+as a shell card, one that takes `code` renders as an execute card, `url` becomes
+a fetch, `query` becomes a search, and a `path` becomes a read, write or edit
+depending on the rest of the arguments.
+
+The fork adapts to OMP's subagent too. OMP's `task` input names its work `task`,
+not `description`, so the subagent card reads both, and the child session OMP
+spawns opens from the card the same way a native subagent does.
 
 One small fix worth calling out: OMP sends edit arguments as `old_string` and
 `new_string`, but the OpenCode editor reads `oldString` and `newString`. openPI
@@ -155,8 +168,9 @@ later prompt. This costs one small model call per session.
   transcript is kept, but the engine does not yet resume its side of the
   conversation automatically.
 - Auth is a single shared Basic auth password, matching the upstream behaviour.
-- The upstream `opencode` binary is still required for the web assets and the
-  proxied endpoints. Bundling the app into this repo is future work.
+- The web app ships as the vendored fork in `opencode/`, so that tree has to be
+  installed and built before the UI is served. `bun run ui:install` and
+  `bun run ui:build` do that.
 
 ## Development
 
@@ -166,7 +180,15 @@ node --watch src/index.ts
 
 # run the tests
 node --test test/
+
+# rebuild the vendored web app after editing opencode/packages/app or
+# opencode/packages/session-ui
+bun run ui:build
 ```
+
+The vendored fork's own package scripts still work from `opencode/`, for example
+`bun run --cwd opencode/packages/session-ui typecheck`. Its tool cards live in
+`opencode/packages/session-ui/src/tools`.
 
 The tests are plain `node:test`. The integration tests drive the server against
 a fake OMP over the real RPC framing, so they cover the SSE stream, the

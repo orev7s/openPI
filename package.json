@@ -11,7 +11,9 @@
     "start": "node src/index.ts",
     "dev": "node --watch src/index.ts",
     "test": "node --test test/",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "ui:install": "bun install --cwd opencode",
+    "ui:build": "bun run --cwd opencode/packages/app build"
   },
   "license": "MIT"
 }

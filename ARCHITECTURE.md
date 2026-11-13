@@ -16,20 +16,22 @@ auth included, with OMP doing the work.
 Browser / mobile client
         | HTTP + SSE (Basic auth), port 4096
 openPI server (Node, this repo)
-   |-- serves OpenCode v2 web app (static)              src/server/app.ts
+   |-- serves the vendored OpenCode v2 web app        opencode/ (fork) + src/server/app.ts
    |-- OpenCode v2 HTTP API subset it owns              src/server/routes.ts
    |     events  GET /api/event (SSE)                   src/core/feed.ts
    |     session CRUD + prompt/message/interrupt/model  src/core/manager.ts
-   |-- proxies everything else to an upstream server    src/server/proxy.ts
+   |-- proxies everything else to the private server    src/server/proxy.ts
    |
    | stdio (OMP RPC, JSONL, protocol v2)                src/omp/client.ts
 omp --mode rpc --session-dir <dir-per-session>           (child process)
 ```
 
 Why proxy? Non-engine endpoints (fs, vcs, worktree, pty, shell, mcp,
-integration, plugin, websearch, debug) are not part of "the engine". An upstream
-`opencode serve` already implements them correctly and also ships the built web
-app. The bridge owns the engine-facing endpoints and forwards the rest.
+integration, plugin, websearch, debug) are not part of "the engine". A private
+OpenCode server implements them correctly and ships the web app. openPI runs the
+vendored fork in `opencode/` for that server, so the UI is ours to change, and
+falls back to an `opencode` binary when the fork is not built. The bridge owns
+the engine-facing endpoints and forwards the rest.
 
 ## Wire contract (captured from opencode v2.2.5)
 
@@ -202,15 +204,18 @@ emit `session.execution.failed` instead of leaving the UI on "working".
 
 OMP tool names are normalized to the names the OpenCode UI renders specially:
 `bash` -> `shell`, `task` -> `subagent`, `eval` -> `execute`, `web_search` ->
-`websearch`. The OpenCode UI only richly renders tool names it ships a renderer
-for, so a tool with no known name is mapped to a renderer by the shape of its
-input (`command` -> shell, `code` -> execute, `url` -> webfetch, `query` ->
-websearch, `pattern` -> grep, `path` -> read/write/edit) and keeps the others
-generic. OMP's `edit` args are also translated from `old_string`/`new_string` to
-the `oldString`/`newString` the renderer reads. A running subagent tool is
-linked to its child session by emitting `session.tool.progress` with
-`metadata.sessionID`, which is what the UI reads to open the subagent. Unknown
-session sub-resources answer with safe defaults so the UI never 404s.
+`websearch`. Every other known OMP tool is forwarded unchanged, and the vendored
+UI registers a card for it (see `opencode/packages/session-ui/src/tools`). A
+tool neither side knows is mapped to a renderer by the shape of its input
+(`command` -> shell, `code` -> execute, `url` -> webfetch, `query` -> websearch,
+`pattern` -> grep, `path` -> read/write/edit) and keeps the tool's output, which
+the generic card now shows instead of hiding. OMP's `edit` args are also
+translated from `old_string`/`new_string` to the `oldString`/`newString` the
+renderer reads. A running subagent tool is linked to its child session by
+emitting `session.tool.progress` with `metadata.sessionID`, which is what the UI
+reads to open the subagent; the subagent card reads OMP's `task` label as well
+as OpenCode's `description`. Unknown session sub-resources answer with safe
+defaults so the UI never 404s.
 
 OMP forces `PI_NO_TITLE=1` in RPC mode, so it never names a session. openPI
 generates the title itself on the first prompt with one short out-of-band
@@ -225,8 +230,9 @@ generates the title itself on the first prompt with one short out-of-band
    proxy fallback, runnable against the real `opencode` upstream.
 2. **UI parity:** model/provider/agent/config endpoints served from OMP, skills,
    commands, permissions, forms, revert/fork, compaction, session titles.
-3. **Self-contained:** build/serve `packages/app` from this repo so the upstream
-   opencode binary is no longer required.
+3. **Self-contained (done):** the OpenCode v2 source is vendored under
+   `opencode/` and its web app is built here, so the upstream opencode binary is
+   optional. Editing tool cards means editing the fork.
 4. **Hardening:** multi-session OMP supervision, reconnect, auth parity, OMP
    session persistence/restore, thinking level, subagents, review.
 
@@ -242,8 +248,11 @@ src/core/ids.ts       evt_/msg_/ses_ id generation
 src/core/attachments.ts prompt attachment URIs -> UI file shape + OMP images
 src/core/manager.ts   session <-> OMP process lifecycle and projection
 src/server/routes.ts  HTTP routes openPI owns
-src/server/proxy.ts   static + API passthrough to upstream
+src/server/proxy.ts   static + API passthrough to the private OpenCode server
+src/server/upstream.ts starts the private server (vendored fork or opencode binary)
 src/server/app.ts     request dispatch
 src/index.ts          entry point / config
+opencode/             the vendored OpenCode v2.2.5 fork (web app + server)
+opencode/packages/session-ui/src/tools  the tool cards, OMP ones included
 test/                 node --test
 ```

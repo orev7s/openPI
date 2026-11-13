@@ -99,6 +99,38 @@ const RENDERER_NAMES = new Set([
   "skill",
 ])
 
+// OMP built-ins the forked UI renders by name. Forward them unchanged instead
+// of guessing from the input shape, which would turn a tool like `find` or
+// `recall` (both take a `query`) into a web search.
+const OMP_TOOL_NAMES = new Set([
+  "find",
+  "lsp",
+  "ast_grep",
+  "ast_edit",
+  "github",
+  "checkpoint",
+  "rewind",
+  "context_notes",
+  "new_context",
+  "security_scan",
+  "debug",
+  "ida",
+  "memory_edit",
+  "retain",
+  "recall",
+  "reflect",
+  "learn",
+  "manage_skill",
+  "browser",
+  "computer",
+  "image_gen",
+  "report_tool_issue",
+  "ask",
+  "run_code",
+  "todo",
+  "wait",
+])
+
 // OpenCode's edit renderer reads camelCase fields; OMP's edit args are snake_case.
 function normalizeToolInput(name: string, input: Record<string, unknown>): Record<string, unknown> {
   if (name !== "edit") return input
@@ -117,6 +149,7 @@ export function rendererName(name: string, input: Record<string, unknown>): stri
   const mapped = TOOL_NAME_MAP[name]
   if (mapped) return mapped
   if (RENDERER_NAMES.has(name)) return name
+  if (OMP_TOOL_NAMES.has(name)) return name
   if (typeof input.command === "string") return "shell"
   if (typeof input.code === "string") return "execute"
   if (typeof input.url === "string") return "webfetch"
