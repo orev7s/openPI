@@ -205,12 +205,14 @@ test("maps unknown tool names to a renderer by input shape and normalizes edit i
     args: { path: "/a.ts", old_string: "x", new_string: "y", replace_all: false },
   })
   feed({ type: "tool_execution_start", toolCallId: "c_custom", toolName: "run_thing", args: { command: "ls -la" } })
+  feed({ type: "tool_execution_start", toolCallId: "c_bg", toolName: "write", args: { path: "xd://bg", content: "{}" } })
 
   const called = out.filter((event) => event.type === "session.tool.called")
   const name = (id: string) => called.find((event) => event.data.id === id)?.data.name
-  assert.equal(name("c_eval"), "execute")
+  assert.equal(name("c_eval"), "eval")
   assert.equal(name("c_search"), "websearch")
   assert.equal(name("c_custom"), "shell")
+  assert.equal(name("c_bg"), "bg")
 
   const edit = called.find((event) => event.data.id === "c_edit")
   assert.equal(edit?.data.name, "edit")

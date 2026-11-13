@@ -75,7 +75,6 @@ function textOf(result: unknown): string {
 const TOOL_NAME_MAP: Record<string, string> = {
   bash: "shell",
   task: "subagent",
-  eval: "execute",
   web_search: "websearch",
 }
 
@@ -103,6 +102,9 @@ const RENDERER_NAMES = new Set([
 // of guessing from the input shape, which would turn a tool like `find` or
 // `recall` (both take a `query`) into a web search.
 const OMP_TOOL_NAMES = new Set([
+  "eval",
+  "python",
+  "notebook",
   "find",
   "lsp",
   "ast_grep",
@@ -129,7 +131,21 @@ const OMP_TOOL_NAMES = new Set([
   "run_code",
   "todo",
   "wait",
+  "bg",
+  "detach",
+  "report_issue",
 ])
+
+// OMP dispatches xdev devices through the file tools: `write xd://<device>`
+// runs one, and `read xd://<device>` fetches its docs. The device is the real
+// tool, so an execution renders under its own name instead of as a file write.
+function xdevDevice(name: string, input: Record<string, unknown>): string | undefined {
+  if (name !== "write") return undefined
+  const path = input.path
+  if (typeof path !== "string" || !path.startsWith("xd://")) return undefined
+  const device = path.slice("xd://".length).split("/")[0]
+  return device && device !== "?" ? device : undefined
+}
 
 // OpenCode's edit renderer reads camelCase fields; OMP's edit args are snake_case.
 function normalizeToolInput(name: string, input: Record<string, unknown>): Record<string, unknown> {
@@ -148,6 +164,8 @@ function normalizeToolInput(name: string, input: Record<string, unknown>): Recor
 export function rendererName(name: string, input: Record<string, unknown>): string {
   const mapped = TOOL_NAME_MAP[name]
   if (mapped) return mapped
+  const device = xdevDevice(name, input)
+  if (device) return device
   if (RENDERER_NAMES.has(name)) return name
   if (OMP_TOOL_NAMES.has(name)) return name
   if (typeof input.command === "string") return "shell"

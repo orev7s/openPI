@@ -268,6 +268,11 @@ const source = {
   "ui.tool.reportIssue": "Report Issue",
   "ui.tool.ask": "Ask",
   "ui.tool.runCode": "Run Code",
+  "ui.tool.eval": "Eval",
+  "ui.tool.python": "Python",
+  "ui.tool.notebook": "Notebook",
+  "ui.tool.bg": "Background Job",
+  "ui.tool.detach": "Detach",
 
   "ui.basicTool.called": "Called `{{tool}}`",
   "ui.toolErrorCard.failed": "Failed",

@@ -64,6 +64,12 @@ const specs: Record<string, OmpToolSpec> = {
   report_tool_issue: { icon: "warning", title: "ui.tool.reportIssue", args: (input) => strings(input, ["tool", "title"]) },
   ask: { icon: "bubble-5", title: "ui.tool.ask" },
   run_code: { icon: "code-slash", title: "ui.tool.runCode" },
+  eval: { icon: "code-slash", title: "ui.tool.eval" },
+  python: { icon: "code-slash", title: "ui.tool.python" },
+  notebook: { icon: "file-document", title: "ui.tool.notebook", args: (input) => strings(input, ["path"]) },
+  bg: { icon: "status", title: "ui.tool.bg" },
+  detach: { icon: "split", title: "ui.tool.detach" },
+  report_issue: { icon: "warning", title: "ui.tool.reportIssue", args: (input) => strings(input, ["tool", "title"]) },
 }
 
 function ToolOutput(props: { output?: string }) {
@@ -89,16 +95,43 @@ function ToolOutput(props: { output?: string }) {
 function OmpTool(props: ToolProps) {
   const i18n = useI18n()
   const spec = createMemo(() => specs[props.tool])
-  const args = createMemo(() => spec()?.args?.((props.input ?? {}) as Record<string, unknown>) ?? [])
+  const input = createMemo(() => (props.input ?? {}) as Record<string, unknown>)
+  const args = createMemo(() => spec()?.args?.(input()) ?? [])
+
+  // eval and python carry the code they ran; an xdev device call carries its
+  // JSON args as `content` on the write that dispatched it.
+  const code = createMemo(() => {
+    const value = input().code
+    if (typeof value !== "string" || !value) return undefined
+    const language = input().language
+    return `\`\`\`${typeof language === "string" ? language : ""}\n${value}\n\`\`\``
+  })
+
+  const device = createMemo(() => {
+    const value = input().content
+    return typeof value === "string" && value ? `\`\`\`json\n${value}\n\`\`\`` : undefined
+  })
 
   return (
     <BasicTool
       {...props}
       icon={spec()?.icon ?? "mcp"}
-      hasContent={!!props.output}
+      hasContent={!!code() || !!device() || !!props.output}
       trigger={{ title: spec() ? i18n.t(spec()!.title) : props.tool, args: args() }}
     >
-      <ToolOutput output={props.output} />
+      <Show when={code() || device() || props.output}>
+        <div
+          data-component="tool-output"
+          data-scrollable
+          tabIndex={0}
+          role="region"
+          aria-label={i18n.t("ui.scrollView.ariaLabel")}
+        >
+          <Show when={code()}>{(text) => <Markdown text={text()} />}</Show>
+          <Show when={device()}>{(text) => <Markdown text={text()} />}</Show>
+          <Show when={props.output}>{(text) => <Markdown text={text()} />}</Show>
+        </div>
+      </Show>
     </BasicTool>
   )
 }
@@ -193,7 +226,6 @@ export function registerOmpTools(registry: Registry): void {
   const aliases: Record<string, string> = {
     bash: "shell",
     task: "subagent",
-    eval: "execute",
     web_search: "websearch",
   }
 
