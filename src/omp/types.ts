@@ -34,6 +34,12 @@ export interface OmpStartOptions {
   command?: string
   /** Extra args after `--mode rpc`. */
   args?: string[]
+  /**
+   * RPC mode for the child. `rpc-ui` (the default for sessions that can prompt)
+   * enables the tool UI context, which is what lets `ask` reach the host as
+   * `extension_ui_request` frames at all.
+   */
+  mode?: "rpc" | "rpc-ui"
   /** Working directory for the child (the project root). */
   cwd: string
   /** Per-session directory so OMP keeps conversations apart. */
@@ -49,6 +55,12 @@ export interface OmpClient {
   readonly ready: Promise<OmpReady>
   /** Send a command and resolve on its correlated response. */
   send<T = unknown>(command: Record<string, unknown> & { type: string }): Promise<OmpResponse>
+  /**
+   * Write a frame nobody answers (`extension_ui_response`), resolving once it
+   * is handed to the child. Never use `send` for these: the response never
+   * arrives and the caller would wait for its timeout.
+   */
+  post(frame: Record<string, unknown> & { type: string }): Promise<void>
   /** Subscribe to agent/streaming events. */
   onEvent(handler: OmpEventHandler): () => void
   /** Resolves when the child exits. */

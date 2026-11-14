@@ -2,8 +2,10 @@ import { join } from "node:path"
 import { startOmp } from "../omp/client.ts"
 import { EventTranslator } from "../omp/map.ts"
 import type { OmpClient, OmpEvent, SessionEventEnvelope } from "../omp/types.ts"
+import { cancelledResponse, planUiRequest } from "../omp/ui-forms.ts"
 import { materializeAttachments, repairStoredMessages } from "./attachments.ts"
 import { Feed } from "./feed.ts"
+import type { Forms } from "./forms.ts"
 import { eventID, messageID, sessionID } from "./ids.ts"
 import { Store } from "./store.ts"
 import { generateTitle as defaultGenerateTitle, type TitleGenerator } from "./title.ts"
@@ -40,6 +42,8 @@ export interface SessionInfo {
 export interface ManagerOptions {
   feed: Feed
   store: Store
+  /** Pending UI forms (OMP dialogs rendered by the OpenCode question dock). */
+  forms: Forms
   /** Root of the project sessions run against. */
   directory: string
   /** Where per-session OMP conversation dirs live. */
@@ -63,6 +67,8 @@ interface Runtime {
   children?: Map<string, Runtime>
   linkedTools?: Set<string>
   titleRequested?: boolean
+  /** OMP UI request id -> the form currently rendering it. */
+  uiForms?: Map<string, string>
 }
 
 const emptyTokens = (): Tokens => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
@@ -71,6 +77,7 @@ const emptyTokens = (): Tokens => ({ input: 0, output: 0, reasoning: 0, cache: {
 export class Manager {
   #feed: Feed
   #store: Store
+  #forms: Forms
   #directory: string
   #dataDir: string
   #command: string
@@ -82,6 +89,7 @@ export class Manager {
   constructor(options: ManagerOptions) {
     this.#feed = options.feed
     this.#store = options.store
+    this.#forms = options.forms
     this.#directory = options.directory
     this.#dataDir = options.dataDir
     this.#command = options.command ?? "omp"
@@ -233,6 +241,7 @@ export class Manager {
   async interrupt(id: string): Promise<void> {
     const rt = this.#runtime(id)
     if (!rt) return
+    this.#forms.cancelSession(id, "interrupted")
     if (rt.omp && rt.translator) {
       for (const envelope of rt.translator.interrupted()) this.#emit(rt, envelope)
       const stopped = await rt.omp.send({ type: "abort" }).then(() => true).catch(() => false)
@@ -334,6 +343,9 @@ export class Manager {
     const omp = await startOmp({
       command: this.#command,
       args: this.#args,
+      // rpc-ui is what enables OMP's tool UI context: without it the `ask` tool
+      // is not even loaded and every dialog resolves before reaching a host.
+      mode: "rpc-ui",
       cwd: rt.info.location.directory,
       sessionDir,
       resume: true,
@@ -362,9 +374,14 @@ export class Manager {
       // Drop the dead client so the next prompt starts a fresh engine instead
       // of failing against a closed pipe.
       if (rt.omp === omp) rt.omp = undefined
+      this.#forms.cancelSession(rt.info.id, "the engine exited")
       this.#engineFailure(rt, new Error(`omp exited (${code})`))
     })
     await omp.send({ type: "set_subagent_subscription", level: "events" }).catch(() => undefined)
+    // Opt this host in to structured `ask` requests (one frame per extension
+    // ui.askDialog call). OMP's own `ask` tool walks its form field by field
+    // over RPC, so the per-dialog methods in #onUiRequest stay load-bearing.
+    await omp.send({ type: "set_ask_dialog", enabled: true }).catch(() => undefined)
     if (rt.info.model) {
       await omp
         .send({ type: "set_model", provider: rt.info.model.providerID, modelId: rt.info.model.id })
@@ -375,6 +392,7 @@ export class Manager {
 
   async #stopEngine(rt: Runtime): Promise<void> {
     rt.closing = true
+    this.#forms.cancelSession(rt.info.id, "the session stopped")
     rt.unsubscribe?.()
     rt.unsubscribe = undefined
     const omp = rt.omp
@@ -387,8 +405,13 @@ export class Manager {
       this.#onSubagentFrame(rt, event)
       return
     }
-    if (event.type === "session_info_update" || event.type === "extension_ui_request") {
-      this.#onTitleFrame(rt, event)
+    if (event.type === "session_info_update") {
+      this.#rename(rt, event.title)
+      return
+    }
+    if (event.type === "extension_ui_request") {
+      if (event.method === "setTitle") this.#rename(rt, event.title)
+      void this.#onUiRequest(rt, event)
       return
     }
     if (!rt.translator) return
@@ -399,14 +422,54 @@ export class Manager {
 
   // OMP names a session either through a state update or, when opted in, a
   // setTitle UI request; both carry the generated title.
-  #onTitleFrame(rt: Runtime, event: OmpEvent): void {
-    const title =
-      event.type === "session_info_update"
-        ? event.title
-        : event.type === "extension_ui_request" && event.method === "setTitle"
-          ? event.title
-          : undefined
-    if (typeof title === "string" && title.trim() && title !== rt.info.title) this.renameSession(rt.info.id, title.trim())
+  #rename(rt: Runtime, title: unknown): void {
+    if (typeof title !== "string" || !title.trim() || title === rt.info.title) return
+    this.renameSession(rt.info.id, title.trim())
+  }
+
+  // ---- engine-initiated dialogs -------------------------------------------
+
+  // Each OMP dialog becomes an OpenCode form, which the vendored UI renders as
+  // a composer dock; whatever the dock submits answers OMP in the shape its
+  // request expects (see src/omp/ui-forms.ts for the mapping).
+  async #onUiRequest(rt: Runtime, event: OmpEvent): Promise<void> {
+    const omp = rt.omp
+    const requestID = typeof event.id === "string" ? event.id : undefined
+    if (!requestID || !omp) return
+    const method = typeof event.method === "string" ? event.method : ""
+
+    // OMP gave up on a dialog on its own (its timer fired, the turn aborted):
+    // close the dock it left behind.
+    if (method === "cancel") {
+      const formID = typeof event.targetId === "string" ? rt.uiForms?.get(event.targetId) : undefined
+      if (formID) this.#forms.cancel(rt.info.id, formID, "the engine cancelled the request")
+      return
+    }
+
+    const plan = planUiRequest(event, requestID)
+    if (!plan) return
+    if (plan.kind === "cancel") {
+      await omp
+        .post({ type: "extension_ui_response", id: requestID, ...cancelledResponse(event) })
+        .catch(() => undefined)
+      return
+    }
+
+    rt.uiForms ??= new Map()
+    const { id, outcome } = this.#forms.ask({
+      sessionID: rt.info.id,
+      location: rt.info.location,
+      title: plan.title,
+      metadata: plan.metadata,
+      fields: plan.fields,
+      ...(plan.timeoutMs !== undefined ? { timeoutMs: plan.timeoutMs } : {}),
+    })
+    rt.uiForms.set(requestID, id)
+    const settled = await outcome
+    rt.uiForms.delete(requestID)
+    const body =
+      settled.status === "answered" ? plan.encode(settled.answer) : cancelledResponse(event, settled.timedOut === true)
+    await omp.post({ type: "extension_ui_response", id: requestID, ...body }).catch(() => undefined)
   }
 
   // OMP task subagents become OpenCode child sessions (parentID), so the UI's

@@ -24,7 +24,7 @@ interface Pending {
 export async function startOmp(options: OmpClientOptions): Promise<OmpClient> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const command = options.command ?? "omp"
-  const ompFlags = ["--mode", "rpc"]
+  const ompFlags = ["--mode", options.mode ?? "rpc"]
   if (options.sessionDir) ompFlags.push("--session-dir", options.sessionDir)
   if (options.resume && options.sessionDir) ompFlags.push("--continue")
   const extra = options.args ?? []
@@ -204,5 +204,12 @@ export async function startOmp(options: OmpClientOptions): Promise<OmpClient> {
 
   const send = (frame: Record<string, unknown> & { type: string }): Promise<OmpResponse> => request(frame, timeoutMs)
 
-  return { ready, send, onEvent, exited, close }
+  // Frames with no response (extension UI answers). Writing through `request`
+  // would leave a pending entry waiting for a reply that never comes.
+  const post = (frame: Record<string, unknown> & { type: string }): Promise<void> => {
+    if (closed || !child.stdin.writable) return Promise.reject(new Error("omp client is closed"))
+    return writeFrame(frame)
+  }
+
+  return { ready, send, post, onEvent, exited, close }
 }

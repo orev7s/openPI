@@ -23,7 +23,7 @@ openPI server (Node, this repo)
    |-- proxies everything else to the private server    src/server/proxy.ts
    |
    | stdio (OMP RPC, JSONL, protocol v2)                src/omp/client.ts
-omp --mode rpc --session-dir <dir-per-session>           (child process)
+omp --mode rpc-ui --session-dir <dir-per-session>        (child process)
 ```
 
 Why proxy? Non-engine endpoints (fs, vcs, worktree, pty, shell, mcp,
@@ -150,6 +150,8 @@ Returns `{ "data": <Session.Inbox.User> }`.
 ## OMP RPC contract
 
 `omp --mode rpc [--session-dir DIR]` speaks newline-delimited JSON on stdio.
+Sessions are spawned with `--mode rpc-ui` (same protocol, plus the tool UI
+context the question dock needs); the catalog-only client stays on plain `rpc`.
 
 Startup: server writes `{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],...}`.
 Client should send `{"id":"...","type":"negotiate_protocol","protocolVersion":2}`.
@@ -177,6 +179,61 @@ Agent events (`packages/agent/src/types.ts`):
 `assistantMessageEvent` streaming variants (`packages/ai/src/types.ts`):
 `start`, `text_start|text_delta|text_end`, `thinking_start|thinking_delta|thinking_end`,
 `toolcall_start|toolcall_delta|toolcall_end`, `image_end`, `done`, `error`.
+
+## User input: OMP dialogs -> OpenCode forms
+
+OMP asks its host for input over the RPC stream (`extension_ui_request`). The
+OpenCode UI has no dialog surface of its own, so openPI turns every dialog into
+a **form**; the vendored UI renders a pending form as a composer dock, and a
+form whose `metadata.kind` is `"question"` opens the question dock, which asks
+the fields in order and offers its own free-text answer.
+
+Engine side (`src/core/manager.ts`):
+
+- Sessions spawn `omp --mode rpc-ui`; plain `rpc` never emits tool UI, so the
+  `ask` tool is not even loaded. `rpc-ui` also pins `PI_NO_PTY=1`, which turns
+  off OMP's interactive PTY bash path.
+- After `ready` the manager sends `set_ask_dialog { enabled: true }`, which opts
+  this host in to the structured `ask` request (one frame carrying every
+  question of an extension `ui.askDialog` call). OMP's own `ask` tool does not
+  use it: over RPC it always walks its HTML form field by field with `select`
+  and `editor`, which is why the per-dialog methods below are the ones that
+  actually carry question forms today.
+- Dialogs become forms as described in `src/omp/ui-forms.ts`: `ask` -> one field
+  per question (`q0`, `q1`, ... in request order, `multiselect` when the question
+  allows several answers), `select`/`editor`/`input`/`confirm` -> one field. The
+  question dock draws its text from the *field*, so `select` puts the request's
+  `title` in `description` and the other methods put it in `title`.
+  A recommended option is hoisted to the front and labelled
+  `"<label> (Recommended)"`; its option `value` stays the untouched label,
+  because OMP matches answers against the labels it sent.
+- OMP's `select` rows are passed through verbatim, sentinels included: its
+  `"Other (type your own)"` row is what makes the engine open its own free-text
+  `input` dialog, and its `"✔ Done selecting"` row is the only way to end a
+  checkbox group. Several answers are a loop — the engine re-asks under a
+  `"(N selected) "` title after every pick — so one dock submission answers one
+  step of it.
+- The answer comes back keyed by field key and is encoded into the request's own
+  response shape (a label that is not one of the options becomes `customInput`).
+  `confirm` answers `{ confirmed }`; everything else `{ value }` or
+  `{ cancelled, timedOut? }`. A request that carries nothing renderable is
+  answered `cancelled` instead of being left unanswered, which would stall the
+  turn; presentation methods (`notify`, `setStatus`, ...) need no answer.
+- `cancel` requests close the dock for the dialog OMP gave up on (its timeout or
+  an abort). Aborting, stopping a session, or losing the engine cancels every
+  form that session is waiting on.
+
+HTTP surface openPI owns (`src/server/routes.ts`, events in `src/core/forms.ts`):
+
+- `GET /api/form` (location-wrapped), `GET|POST /api/session/:id/form`,
+  `GET /api/session/:id/form/:formID`,
+  `POST /api/session/:id/form/:formID/reply` `{ answer }`,
+  `DELETE /api/session/:id/form/:formID?message=`.
+- SSE: `form.created` `{ form }`, `form.replied` `{ id, sessionID, answer }`,
+  `form.cancelled` `{ id, sessionID }`. Forms are **ephemeral**: no `durable`
+  field, nothing in the transcript, nothing across a restart.
+- A settled form is gone from the registry, so a second reply answers 404 — what
+  the UI reads as "already answered".
 
 ## Mapping OMP -> OpenCode
 

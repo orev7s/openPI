@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http"
 import { Manager } from "../core/manager.ts"
 import { Feed } from "../core/feed.ts"
+import { Forms } from "../core/forms.ts"
 import { Store } from "../core/store.ts"
 import type { TitleGenerator } from "../core/title.ts"
 import { handleOwned, type RouteContext } from "./routes.ts"
@@ -32,9 +33,11 @@ export interface App {
 export function createApp(options: AppOptions): App {
   const feed = new Feed()
   const store = new Store(options.storePath ?? options.dataDir + "/openpi.db")
+  const forms = new Forms(feed)
   const manager = new Manager({
     feed,
     store,
+    forms,
     directory: options.directory,
     dataDir: options.dataDir,
     ...(options.ompCommand ? { command: options.ompCommand } : {}),
@@ -54,6 +57,7 @@ export function createApp(options: AppOptions): App {
       url: new URL(req.url ?? "/", "http://localhost"),
       manager,
       feed,
+      forms,
       directory: options.directory,
       version,
       password: options.password,

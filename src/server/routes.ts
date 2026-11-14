@@ -1,6 +1,7 @@
 import { hostname } from "node:os"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import { Manager, projectID } from "../core/manager.ts"
+import type { FormAnswer, Forms } from "../core/forms.ts"
 import { eventID } from "../core/ids.ts"
 import type { Feed } from "../core/feed.ts"
 import { readJson, sendError, sendJson, withLocation } from "./http.ts"
@@ -11,6 +12,7 @@ export interface RouteContext {
   url: URL
   manager: Manager
   feed: Feed
+  forms: Forms
   directory: string
   version: string
 }
@@ -83,11 +85,19 @@ export async function handleOwned(ctx: RouteContext): Promise<boolean> {
     return true
   }
 
+  // Pending forms for a location. Session-scoped dialogs arrive on
+  // /api/session/:id/form; this is the unscoped listing the UI polls for its
+  // global (MCP elicitation) sentinel.
+  if (path === "/api/form" && method === "GET") {
+    const directory = url.searchParams.get("location[directory]") ?? ctx.directory
+    sendJson(res, 200, withLocation(directory, ctx.forms.list(undefined, directory)))
+    return true
+  }
+
   if (path === "/api/session" && method === "GET") {
     sendJson(res, 200, { data: listSessions(ctx), cursor: {} })
     return true
   }
-
   if (path === "/api/session" && method === "POST") {
     const body = await readJson(req)
     sendJson(res, 200, { data: ctx.manager.createSession(body as never) })
@@ -187,14 +197,23 @@ async function handleSession(ctx: RouteContext, method: string): Promise<void> {
     case "revert":
       res.writeHead(204).end()
       return
+    case "form": {
+      // Forms are opened by the engine bridge (an OMP dialog), never by the UI.
+      if (method === "GET") sendJson(res, 200, { data: ctx.forms.list(id) })
+      else sendError(res, 404, "InvalidRequestError", `No route for ${ctx.url.pathname}`)
+      return
+    }
     case "inbox":
     case "permission":
-    case "form":
     case "diff":
     case "log":
       sendJson(res, 200, { data: [] })
       return
     default: {
+      if (action?.startsWith("form/")) {
+        await handleForm(ctx, method, id, action.slice("form/".length))
+        return
+      }
       if (action?.startsWith("inbox/")) {
         if (method === "DELETE") manager.cancelInbox(id, action.slice("inbox/".length))
         res.writeHead(204).end()
@@ -207,6 +226,52 @@ async function handleSession(ctx: RouteContext, method: string): Promise<void> {
       return
     }
   }
+}
+
+// The question dock's reply, read and dismiss routes. A settled form is gone
+// from the registry; that 404 is what the UI treats as "already answered" and
+// clears locally.
+async function handleForm(ctx: RouteContext, method: string, sessionID: string, rest: string): Promise<void> {
+  const { req, res, url, forms } = ctx
+  const slash = rest.indexOf("/")
+  const formID = slash === -1 ? rest : rest.slice(0, slash)
+  const verb = slash === -1 ? undefined : rest.slice(slash + 1)
+
+  if (verb === "reply" && method === "POST") {
+    const body = await readJson(req)
+    const answer = body.answer
+    if (typeof answer !== "object" || answer === null || Array.isArray(answer)) {
+      sendError(res, 400, "FormInvalidAnswerError", "answer must be an object keyed by field")
+      return
+    }
+    if (!forms.reply(sessionID, formID, answer as FormAnswer)) {
+      sendError(res, 404, "FormNotFoundError", `Form not found: ${formID}`)
+      return
+    }
+    res.writeHead(204).end()
+    return
+  }
+
+  if (verb === undefined && method === "GET") {
+    const detail = forms.detail(sessionID, formID)
+    if (!detail) {
+      sendError(res, 404, "FormNotFoundError", `Form not found: ${formID}`)
+      return
+    }
+    sendJson(res, 200, { data: detail })
+    return
+  }
+
+  if (verb === undefined && method === "DELETE") {
+    if (!forms.cancel(sessionID, formID, url.searchParams.get("message") ?? undefined)) {
+      sendError(res, 404, "FormNotFoundError", `Form not found: ${formID}`)
+      return
+    }
+    res.writeHead(204).end()
+    return
+  }
+
+  sendError(res, 404, "InvalidRequestError", `No route for ${url.pathname}`)
 }
 
 function orderedMessages(ctx: RouteContext, id: string): unknown[] {
